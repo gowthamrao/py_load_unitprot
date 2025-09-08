@@ -2,10 +2,12 @@ import pytest
 import gzip
 from pathlib import Path
 import psycopg2
+import yaml
 
 from typer.testing import CliRunner
 from py_load_uniprot import transformer
 from py_load_uniprot.cli import app
+from py_load_uniprot.config import Settings, initialize_settings
 from py_load_uniprot.db_manager import PostgresAdapter, postgres_connection, TABLE_LOAD_ORDER
 import datetime
 from testcontainers.postgres import PostgresContainer
@@ -20,8 +22,9 @@ def postgres_container():
     with PostgresContainer("postgres:15-alpine") as postgres:
         yield postgres
 
-# A more comprehensive XML sample for integration testing
-SAMPLE_XML_CONTENT = """<?xml version="1.0" encoding="UTF-8"?>
+@pytest.fixture(scope="session")
+def sample_xml_content():
+    return """<?xml version="1.0" encoding="UTF-8"?>
 <uniprot xmlns="http://uniprot.org/uniprot">
 <entry dataset="Swiss-Prot" created="2000-05-30" modified="2024-07-17" version="150">
   <accession>P12345</accession>
@@ -61,29 +64,36 @@ SAMPLE_XML_CONTENT = """<?xml version="1.0" encoding="UTF-8"?>
 """
 
 @pytest.fixture
-def sample_xml_file(tmp_path: Path) -> Path:
+def sample_xml_file(tmp_path: Path, sample_xml_content: str) -> Path:
     """Creates a gzipped sample XML file for testing."""
     xml_path = tmp_path / "sample.xml.gz"
     with gzip.open(xml_path, "wt", encoding="utf-8") as f:
-        f.write(SAMPLE_XML_CONTENT)
+        f.write(sample_xml_content)
     return xml_path
 
 @pytest.fixture
-def mock_db_settings(mocker, postgres_container: PostgresContainer):
+def db_adapter(postgres_container: PostgresContainer) -> PostgresAdapter:
     """
-    Mocks the database connection string to point to the test container.
+    Provides a PostgresAdapter and initializes settings to use the test container.
+    This fixture allows for component-level testing of the db_adapter.
     """
-    conn_url = postgres_container.get_connection_url()
-    mocker.patch.object(settings, 'db_connection_string', conn_url)
-    yield conn_url
+    # Create a Settings object pointing to the test container
+    test_settings = Settings(
+        db={
+            "host": postgres_container.get_container_host_ip(),
+            "port": int(postgres_container.get_exposed_port(5432)),
+            "user": postgres_container.username,
+            "password": postgres_container.password,
+            "dbname": postgres_container.dbname,
+        }
+    )
+    # Manually initialize the settings for the scope of this test
+    initialize_settings()
+    # We have to monkeypatch the global settings instance for this test
+    # This is less ideal than using the CLI but necessary for component testing.
+    import py_load_uniprot.config
+    py_load_uniprot.config._settings_instance = test_settings
 
-
-@pytest.fixture
-def db_adapter(mock_db_settings) -> PostgresAdapter:
-    """
-    Provides a PostgresAdapter configured for integration testing against the testcontainer
-    and handles cleanup.
-    """
     adapter = PostgresAdapter(
         staging_schema="integration_test_staging",
         production_schema="integration_test_public"
@@ -143,10 +153,10 @@ def sample_xml_v2_file(tmp_path: Path) -> Path:
     return xml_path
 
 
-def test_full_etl_pipeline(sample_xml_file: Path, db_adapter: PostgresAdapter, tmp_path: Path):
+def test_full_etl_pipeline_components(sample_xml_file: Path, db_adapter: PostgresAdapter, tmp_path: Path):
     """
-    Tests the full ETL pipeline: Transform -> Initialize -> Load -> Finalize -> Metadata.
-    This test requires a running PostgreSQL instance.
+    Tests the database adapter components: Transform -> Initialize -> Load -> Finalize -> Metadata.
+    This test requires a running PostgreSQL instance and uses the db_adapter fixture.
     """
     # Arrange
     output_dir = tmp_path / "transformed_output"
@@ -266,68 +276,6 @@ def test_delta_load_pipeline(sample_xml_file: Path, sample_xml_v2_file: Path, db
         assert cur.fetchone()[0] == 'V2_TEST'
 
 
-from py_load_uniprot.pipeline import PyLoadUniprotPipeline
-from py_load_uniprot.config import settings
-
-
-def test_pipeline_api_full_load(db_adapter: PostgresAdapter, sample_xml_file: Path, tmp_path: Path, mocker):
-    """
-    Tests that the public PyLoadUniprotPipeline API correctly runs a full load.
-    This test mocks the extraction and transformation steps to focus on the pipeline's
-    orchestration and loading logic.
-    """
-    # Arrange
-    # Point the settings to our temporary test data directory
-    mocker.patch.object(settings, 'DATA_DIR', tmp_path)
-    # The pipeline expects the file to be named correctly
-    test_sprot_path = tmp_path / "uniprot_swissprot.xml.gz"
-    with gzip.open(sample_xml_file, 'rb') as f_in, gzip.open(test_sprot_path, 'wb') as f_out:
-        f_out.writelines(f_in)
-
-    # Mock the extractor to prevent network calls and return controlled metadata
-    mock_release_info = {
-        "release_version": "API_TEST",
-        "release_date": datetime.date(2025, 3, 15),
-        "swissprot_entry_count": 2,
-        "trembl_entry_count": 0,
-    }
-    mocker.patch("py_load_uniprot.extractor.run_extraction", return_value=mock_release_info)
-
-    # The pipeline's `run` method internally calls the transformer.
-    # For this test, we want to control the input to the loader, so we run the
-    # transformation once ourselves to generate the files.
-    # The loader part of the pipeline will then use these generated files.
-    transformer.transform_xml_to_tsv(test_sprot_path, tmp_path)
-
-    # We then mock the transformer within the pipeline run itself to avoid re-running it
-    # and to isolate the test to the pipeline's orchestration logic.
-    mocker.patch("py_load_uniprot.transformer.transform_xml_to_tsv", return_value=None)
-
-
-    # --- Act ---
-    # Instantiate the pipeline and run it
-    pipeline = PyLoadUniprotPipeline()
-    # We need to manually override the adapter to use our test-specific schema names
-    pipeline.db_adapter = db_adapter
-    pipeline.run(dataset="swissprot", mode="full")
-
-    # --- Assert ---
-    with postgres_connection() as conn, conn.cursor() as cur:
-        # Assert schema and table structure
-        cur.execute("SELECT 1 FROM pg_namespace WHERE nspname = %s", (db_adapter.production_schema,))
-        assert cur.fetchone() is not None, "Production schema should exist after pipeline run"
-
-        # Assert data integrity
-        cur.execute(f"SELECT COUNT(*) FROM {db_adapter.production_schema}.proteins")
-        assert cur.fetchone()[0] == 2, "There should be 2 proteins loaded"
-        cur.execute(f"SELECT uniprot_id FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P67890'")
-        assert cur.fetchone()[0] == 'TEST2_MOUSE'
-
-        # Assert Metadata
-        cur.execute(f"SELECT release_version FROM {db_adapter.production_schema}.py_load_uniprot_metadata")
-        assert cur.fetchone()[0] == "API_TEST"
-
-
 def test_status_command_reporting(db_adapter: PostgresAdapter, sample_xml_file: Path, tmp_path: Path):
     """
     Tests that the get_current_release_version function (used by the status command)
@@ -357,3 +305,77 @@ def test_status_command_reporting(db_adapter: PostgresAdapter, sample_xml_file: 
     # Now, check the version again
     version = db_adapter.get_current_release_version()
     assert version == "2025_STATUS_TEST", "get_current_release_version should return the loaded version"
+
+
+def test_cli_full_load_with_yaml_config(postgres_container: PostgresContainer, sample_xml_file: Path, tmp_path: Path, mocker):
+    """
+    Tests the full end-to-end pipeline via the CLI, configured with a YAML file.
+    This is the most comprehensive integration test.
+    """
+    # --- Arrange ---
+    # 1. Create a temporary data directory and place the sample XML file in it
+    data_dir = tmp_path / "test_data"
+    data_dir.mkdir()
+    test_sprot_path = data_dir / "uniprot_swissprot.xml.gz"
+    with gzip.open(sample_xml_file, 'rb') as f_in, gzip.open(test_sprot_path, 'wb') as f_out:
+        f_out.writelines(f_in)
+
+    # 2. Create a temporary YAML config file pointing to the test container
+    db_url = postgres_container.get_connection_url()
+    config_data = {
+        "data_dir": str(data_dir),
+        "db": {
+            "host": postgres_container.get_container_host_ip(),
+            "port": int(postgres_container.get_exposed_port(5432)),
+            "user": postgres_container.username,
+            "password": postgres_container.password,
+            "dbname": postgres_container.dbname,
+        }
+    }
+    config_path = tmp_path / "test_config.yaml"
+    with open(config_path, "w") as f:
+        yaml.dump(config_data, f)
+
+    # 3. Mock the extractor to prevent network calls
+    mock_release_info = {
+        "release_version": "CLI_YAML_TEST",
+        "release_date": datetime.date(2025, 4, 1),
+        "swissprot_entry_count": 2,
+        "trembl_entry_count": 0,
+    }
+    mocker.patch("py_load_uniprot.extractor.run_extraction", return_value=mock_release_info)
+
+    # --- Act ---
+    # Run the 'run' command via the Typer test runner
+    result = runner.invoke(
+        app,
+        [
+            "--config", str(config_path),
+            "run",
+            "--dataset", "swissprot",
+            "--mode", "full",
+        ],
+        catch_exceptions=False # Set to False to see full traceback on error
+    )
+
+    # --- Assert ---
+    # 1. Check CLI output
+    assert result.exit_code == 0
+    assert "ETL pipeline completed successfully!" in result.stdout
+
+    # 2. Check database state
+    prod_schema = "uniprot_public" # Default production schema
+    with psycopg2.connect(db_url) as conn, conn.cursor() as cur:
+        # Check that the production schema exists and staging is gone
+        cur.execute("SELECT 1 FROM pg_namespace WHERE nspname = %s", (prod_schema,))
+        assert cur.fetchone() is not None, "Production schema should exist"
+        cur.execute("SELECT 1 FROM pg_namespace WHERE nspname = 'uniprot_staging'")
+        assert cur.fetchone() is None, "Staging schema should be gone"
+
+        # Check that data was loaded
+        cur.execute(f"SELECT COUNT(*) FROM {prod_schema}.proteins")
+        assert cur.fetchone()[0] == 2
+
+        # Check that metadata was loaded
+        cur.execute(f"SELECT release_version FROM {prod_schema}.py_load_uniprot_metadata")
+        assert cur.fetchone()[0] == "CLI_YAML_TEST"

@@ -6,7 +6,7 @@ import psycopg2
 from rich import print
 import datetime
 
-from py_load_uniprot.config import settings
+from py_load_uniprot.config import get_settings
 from py_load_uniprot.transformer import TABLE_HEADERS
 
 TABLE_LOAD_ORDER = [
@@ -17,6 +17,7 @@ TABLES_WITH_UNIQUE_CONSTRAINTS = {'taxonomy': 'ncbi_taxid'}
 
 @contextmanager
 def postgres_connection():
+    settings = get_settings()
     conn = None
     try:
         conn = psycopg2.connect(settings.db_connection_string)

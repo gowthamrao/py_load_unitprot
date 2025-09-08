@@ -1,11 +1,13 @@
 import csv
 import gzip
 import json
+import multiprocessing
+import os
 from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
 from lxml import etree
-from rich.progress import Progress
+from rich.progress import Progress, BarColumn, TextColumn
 
 # UniProt XML namespace
 UNIPROT_NAMESPACE = "{http://uniprot.org/uniprot}"
@@ -50,6 +52,26 @@ def _element_to_json(element) -> str | None:
     # We will handle this by creating a list of dictionaries
     data_list = [element_to_dict(el) for el in element]
     return json.dumps(data_list) if data_list else None
+
+def _worker_parse_entry(tasks_queue: multiprocessing.Queue, results_queue: multiprocessing.Queue):
+    """
+    Worker process function.
+    Pulls a raw XML string from the tasks queue, parses it, and puts the
+    structured data dictionary onto the results queue.
+    """
+    while True:
+        xml_string = tasks_queue.get()
+        if xml_string is None:  # Sentinel value to signal termination
+            break
+        try:
+            # fromstring is faster than parsing a file-like object
+            elem = etree.fromstring(xml_string)
+            parsed_data = _parse_entry(elem)
+            results_queue.put(parsed_data)
+        except etree.XMLSyntaxError:
+            # Handle potential errors in XML snippets
+            # In a real-world scenario, you might log this
+            results_queue.put({}) # Put an empty dict to not stall the writer
 
 def _parse_entry(elem) -> dict[str, list]:
     """
@@ -150,40 +172,102 @@ def FileWriterManager(output_dir: Path):
         for f in file_handles.values():
             f.close()
 
-def transform_xml_to_tsv(xml_file: Path, output_dir: Path):
+def _writer_process(results_queue: multiprocessing.Queue, output_dir: Path, total_entries: int, num_workers: int):
     """
-    Parses a UniProt XML file and transforms the data into a set of gzipped TSV
-    files corresponding to the relational schema.
+    Writer process function.
+    Pulls parsed data from the results queue and writes it to TSV files.
+    Also manages a progress bar.
     """
-    print(f"Starting transformation of {xml_file.name}...")
+    processed_count = 0
+    # Use a set to efficiently handle duplicate taxonomy entries, as they are common
+    seen_taxonomy_ids = set()
+
+    with FileWriterManager(output_dir) as writers, Progress(
+        TextColumn("[bold blue]Parsing Entries...", justify="right"),
+        BarColumn(),
+        "[progress.percentage]{task.percentage:>3.1f}%",
+        TextColumn("({task.completed} of {task.total})")
+    ) as progress:
+        task = progress.add_task("Parsing...", total=total_entries)
+
+        while processed_count < total_entries:
+            parsed_data = results_queue.get()
+            if parsed_data: # Ensure it's not an empty dict from a parse error
+                for table_name, rows in parsed_data.items():
+                    if table_name == "taxonomy":
+                        # De-duplicate taxonomy entries before writing
+                        unique_rows = []
+                        for row in rows:
+                            tax_id = row[0] # ncbi_taxid is the first element
+                            if tax_id not in seen_taxonomy_ids:
+                                unique_rows.append(row)
+                                seen_taxonomy_ids.add(tax_id)
+                        if unique_rows:
+                            writers[table_name].writerows(unique_rows)
+                    else:
+                        writers[table_name].writerows(rows)
+            processed_count += 1
+            progress.update(task, advance=1)
+
+def _get_total_entries(xml_file: Path) -> int:
+    """Quickly count the number of <entry> tags for the progress bar."""
+    print("Counting total entries for progress tracking...")
+    count = 0
+    with gzip.open(xml_file, "rb") as f:
+        # Use iterparse on a non-blocking fast event to count entries
+        for event, _ in etree.iterparse(f, events=("end",), tag=_get_tag("entry")):
+            count += 1
+    print(f"Found {count} total entries.")
+    return count
+
+def transform_xml_to_tsv(xml_file: Path, output_dir: Path, num_workers: int = os.cpu_count()):
+    """
+    Parses a UniProt XML file in parallel and transforms the data into gzipped TSV files.
+    """
+    print(f"Starting parallel transformation of {xml_file.name} with {num_workers} worker processes...")
     print(f"Output will be written to: {output_dir.resolve()}")
 
-    with gzip.open(xml_file, "rb") as f_in, FileWriterManager(output_dir) as writers:
-        context = etree.iterparse(f_in, events=("end",), tag=_get_tag("entry"))
+    total_entries = _get_total_entries(xml_file)
+    if total_entries == 0:
+        print("[yellow]Warning: No entries found in the XML file. Nothing to do.[/yellow]")
+        return
 
-        # Use a simple counter instead of rich progress for now to avoid overhead
-        count = 0
-        for event, elem in context:
-            parsed_data = _parse_entry(elem)
+    # Use a manager for shared queues between processes
+    with multiprocessing.Manager() as manager:
+        tasks_queue = manager.Queue(maxsize=num_workers * 4) # Bounded queue to prevent memory bloat
+        results_queue = manager.Queue()
 
-            for table_name, rows in parsed_data.items():
-                # The data for taxonomy is unique, so we should avoid duplicates
-                # This simple check is not perfectly efficient but handles the case
-                if table_name == "taxonomy":
-                    # A basic way to handle duplicate taxonomy entries in a batch
-                    # A more robust solution might use a set outside the loop
-                    pass # For now, we accept duplicates, DB will handle on INSERT
-                writers[table_name].writerows(rows)
+        # Start the dedicated writer process
+        writer = multiprocessing.Process(
+            target=_writer_process,
+            args=(results_queue, output_dir, total_entries, num_workers)
+        )
+        writer.start()
 
-            count += 1
-            if count % 10000 == 0:
-                print(f"  ...processed {count} entries")
+        # Start a pool of worker processes
+        pool = multiprocessing.Pool(num_workers, _worker_parse_entry, (tasks_queue, results_queue))
 
-            # Crucial memory management
-            elem.clear()
-            while elem.getprevious() is not None:
-                del elem.getparent()[0]
+        # --- Producer ---
+        # The main process becomes the producer, reading the XML and queuing tasks
+        with gzip.open(xml_file, "rb") as f_in:
+            for event, elem in etree.iterparse(f_in, events=("end",), tag=_get_tag("entry")):
+                # Convert the element to a string to pass it to the queue
+                xml_string = etree.tostring(elem, encoding='unicode')
+                tasks_queue.put(xml_string)
+                # Crucial memory management
+                elem.clear()
+                while elem.getprevious() is not None:
+                    del elem.getparent()[0]
 
-        print(f"[green]Finished parsing {count} entries.[/green]")
+        # Signal workers to terminate by putting None on the queue
+        for _ in range(num_workers):
+            tasks_queue.put(None)
 
-    print(f"[bold green]Transformation complete.[/bold green]")
+        # Wait for all worker processes to finish
+        pool.close()
+        pool.join()
+
+        # Wait for the writer process to finish
+        writer.join()
+
+    print(f"[bold green]Parallel transformation complete.[/bold green]")

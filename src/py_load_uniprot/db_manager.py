@@ -132,10 +132,14 @@ class PostgresAdapter(DatabaseAdapter):
         print("[green]ANALYZE complete.[/green]")
 
     def finalize_load(self, mode: str) -> None:
-        if mode != 'full':
-            print(f"[yellow]Finalize step for mode '{mode}' not implemented. Skipping.[/yellow]")
-            return
+        if mode == 'full':
+            self._finalize_full_load()
+        elif mode == 'delta':
+            self._finalize_delta_load()
+        else:
+            print(f"[bold red]Unsupported load mode '{mode}' in finalize_load.[/bold red]")
 
+    def _finalize_full_load(self) -> None:
         print("[bold blue]Finalizing full load: creating indexes and performing schema swap...[/bold blue]")
         with postgres_connection() as conn, conn.cursor() as cur:
             self._create_indexes(cur)
@@ -146,7 +150,6 @@ class PostgresAdapter(DatabaseAdapter):
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             archive_schema_name = f"{self.production_schema}_old_{timestamp}"
 
-            # Check if production schema exists before trying to rename it
             cur.execute("SELECT 1 FROM pg_namespace WHERE nspname = %s", (self.production_schema,))
             if cur.fetchone():
                 print(f"Archiving existing schema '{self.production_schema}' to '{archive_schema_name}'...")
@@ -154,9 +157,138 @@ class PostgresAdapter(DatabaseAdapter):
 
             print(f"Activating new schema by renaming '{self.staging_schema}' to '{self.production_schema}'...")
             cur.execute(f"ALTER SCHEMA {self.staging_schema} RENAME TO {self.production_schema};")
-
             conn.commit()
-            print(f"[bold green]Schema swap complete. '{self.production_schema}' is now live.[/bold green]")
+        print(f"[bold green]Schema swap complete. '{self.production_schema}' is now live.[/bold green]")
+
+    def _finalize_delta_load(self) -> None:
+        print("[bold blue]Finalizing delta load: merging staging into production...[/bold blue]")
+        with postgres_connection() as conn, conn.cursor() as cur:
+            self._create_production_schema_if_not_exists(cur)
+            self._execute_delta_update(cur)
+            conn.commit()
+        print("[bold green]Delta load complete.[/bold green]")
+
+    def _create_production_schema_if_not_exists(self, cur) -> None:
+        """Creates the production schema and its tables if they don't exist."""
+        print(f"Ensuring production schema '{self.production_schema}' exists...")
+        cur.execute(f"CREATE SCHEMA IF NOT EXISTS {self.production_schema};")
+        # Swap out the schema name to create the production tables
+        production_ddl = self._get_schema_ddl().replace(self.staging_schema, self.production_schema)
+        cur.execute(production_ddl)
+        print("Production schema is ready.")
+
+    def _execute_delta_update(self, cur) -> None:
+        """Orchestrates the SQL operations for a delta update."""
+        print("Starting delta update process...")
+
+        # 1. Upsert core entities
+        self._upsert_proteins(cur)
+        self._upsert_sequences(cur)
+        self._upsert_taxonomy(cur)
+
+        # 2. Sync child tables (Delete old, insert new)
+        self._sync_child_table(cur, 'accessions', ['protein_accession', 'secondary_accession'])
+        self._sync_child_table(cur, 'genes', ['protein_accession', 'gene_name'])
+        self._sync_child_table(cur, 'keywords', ['protein_accession', 'keyword_id'])
+        self._sync_child_table(cur, 'protein_to_go', ['protein_accession', 'go_term_id'])
+        self._sync_child_table(cur, 'protein_to_taxonomy', ['protein_accession', 'ncbi_taxid'])
+
+        # 3. Handle deleted proteins
+        self._delete_removed_proteins(cur)
+
+        # 4. Analyze updated tables for performance
+        print("Running ANALYZE on production schema...")
+        cur.execute(f"ANALYZE {self.production_schema}.proteins;")
+        cur.execute(f"ANALYZE {self.production_schema}.sequences;")
+        cur.execute(f"ANALYZE {self.production_schema}.taxonomy;")
+
+    def _upsert_proteins(self, cur) -> None:
+        print("Upserting proteins...")
+        sql = f"""
+        INSERT INTO {self.production_schema}.proteins
+        SELECT * FROM {self.staging_schema}.proteins
+        ON CONFLICT (primary_accession) DO UPDATE SET
+            uniprot_id = EXCLUDED.uniprot_id,
+            sequence_length = EXCLUDED.sequence_length,
+            molecular_weight = EXCLUDED.molecular_weight,
+            modified_date = EXCLUDED.modified_date,
+            comments_data = EXCLUDED.comments_data,
+            features_data = EXCLUDED.features_data,
+            db_references_data = EXCLUDED.db_references_data;
+        """
+        cur.execute(sql)
+        print(f"{cur.rowcount} proteins upserted.")
+
+    def _upsert_sequences(self, cur) -> None:
+        print("Upserting sequences...")
+        sql = f"""
+        INSERT INTO {self.production_schema}.sequences
+        SELECT * FROM {self.staging_schema}.sequences
+        ON CONFLICT (primary_accession) DO UPDATE SET
+            sequence = EXCLUDED.sequence;
+        """
+        cur.execute(sql)
+        print(f"{cur.rowcount} sequences upserted.")
+
+    def _upsert_taxonomy(self, cur) -> None:
+        print("Upserting taxonomy...")
+        sql = f"""
+        INSERT INTO {self.production_schema}.taxonomy
+        SELECT * FROM {self.staging_schema}.taxonomy
+        ON CONFLICT (ncbi_taxid) DO UPDATE SET
+            scientific_name = EXCLUDED.scientific_name,
+            lineage = EXCLUDED.lineage;
+        """
+        cur.execute(sql)
+        print(f"{cur.rowcount} taxonomy terms upserted.")
+
+    def _sync_child_table(self, cur, table_name: str, primary_keys: list[str]):
+        print(f"Syncing child table: {table_name}...")
+        pk_string = ", ".join(primary_keys)
+
+        # Delete records for updated proteins that are no longer valid
+        delete_sql = f"""
+        DELETE FROM {self.production_schema}.{table_name} prod
+        WHERE prod.protein_accession IN (SELECT primary_accession FROM {self.staging_schema}.proteins)
+          AND NOT EXISTS (
+            SELECT 1 FROM {self.staging_schema}.{table_name} stage
+            WHERE ({pk_string}) = ({", ".join([f'prod.{k}' for k in primary_keys])})
+        );
+        """
+        cur.execute(delete_sql)
+        print(f"  - {cur.rowcount} old records deleted.")
+
+        # Insert new records, ignoring ones that already exist
+        insert_sql = f"""
+        INSERT INTO {self.production_schema}.{table_name}
+        SELECT * FROM {self.staging_schema}.{table_name}
+        ON CONFLICT ({pk_string}) DO NOTHING;
+        """
+        cur.execute(insert_sql)
+        print(f"  - {cur.rowcount} new records inserted.")
+
+    def _delete_removed_proteins(self, cur) -> None:
+        print("Identifying and deleting removed proteins...")
+        # Find proteins in production that are NOT in staging
+        find_deleted_sql = f"""
+        SELECT prod.primary_accession
+        FROM {self.production_schema}.proteins prod
+        LEFT JOIN {self.staging_schema}.proteins stage
+        ON prod.primary_accession = stage.primary_accession
+        WHERE stage.primary_accession IS NULL;
+        """
+        cur.execute(find_deleted_sql)
+        deleted_accessions = [row[0] for row in cur.fetchall()]
+
+        if not deleted_accessions:
+            print("No proteins to delete.")
+            return
+
+        print(f"Found {len(deleted_accessions)} proteins to delete.")
+        # The CASCADE on the foreign key will handle deletion from all child tables
+        delete_sql = f"DELETE FROM {self.production_schema}.proteins WHERE primary_accession = ANY(%s);"
+        cur.execute(delete_sql, (deleted_accessions,))
+        print(f"{cur.rowcount} proteins and their related data deleted from production.")
 
     def get_current_release_version(self) -> str | None:
         print("[yellow]Get current release version not yet implemented.[/yellow]")

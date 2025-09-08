@@ -1,6 +1,6 @@
 [project]
 name = "py-load-uniprot"
-version = "0.1.0"
+version = "0.2.0"
 description = "A high-performance Python package for ETL processing of UniProtKB data into relational databases."
 authors = [
     {name = "Gowtham Rao", email = "rao@ohdsi.org"},
@@ -29,4 +29,5 @@ pythonpath = [
 dev = [
     "pytest>=8.4.2",
     "pytest-mock>=3.15.0",
+    "testcontainers[postgres]>=4.6.0",
 ]

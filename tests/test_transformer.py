@@ -139,6 +139,60 @@ def test_transform_xml_to_tsv_creates_correct_output(sample_xml_file: Path, tmp_
         ["P12345", "KW-0181", "Complete proteome"]
     ]
 
+def test_parse_entry_extracts_evidence_data():
+    """
+    Tests that _parse_entry correctly finds all evidence tags, including nested
+    ones, and serializes them into the `evidence_data` field.
+    """
+    # Arrange
+    from lxml import etree
+    xml_string = """
+<entry created="2000-05-30" modified="2024-07-17" version="150" xmlns="http://uniprot.org/uniprot">
+  <accession>P12345</accession>
+  <name>TEST1_HUMAN</name>
+  <sequence length="10" mass="1111">MTESTSEQAA</sequence>
+  <evidence key="1" type="ECO:0000269">
+    <source>
+      <dbReference type="PubMed" id="12345"/>
+    </source>
+  </evidence>
+  <feature type="chain" description="Test protein 1" id="PRO_0000021325">
+    <location><begin position="1"/><end position="10"/></location>
+    <evidence key="2" type="ECO:0000256"/>
+  </feature>
+</entry>
+"""
+    elem = etree.fromstring(xml_string)
+
+    # Act
+    parsed_data = transformer._parse_entry(elem)
+
+    # Assert
+    assert "proteins" in parsed_data
+    assert len(parsed_data["proteins"]) == 1
+
+    protein_row = parsed_data["proteins"][0]
+    # The evidence_data is the 10th column (index 9)
+    evidence_json_str = protein_row[9]
+
+    assert evidence_json_str is not None
+    evidence_list = json.loads(evidence_json_str)
+
+    assert isinstance(evidence_list, list)
+    assert len(evidence_list) == 2
+
+    # Check for evidence key "1"
+    evidence_1 = next((e for e in evidence_list if e.get("attributes", {}).get("key") == "1"), None)
+    assert evidence_1 is not None
+    assert evidence_1["attributes"]["type"] == "ECO:0000269"
+    assert evidence_1["children"][0]["tag"] == "source"
+
+    # Check for evidence key "2"
+    evidence_2 = next((e for e in evidence_list if e.get("attributes", {}).get("key") == "2"), None)
+    assert evidence_2 is not None
+    assert evidence_2["attributes"]["type"] == "ECO:0000256"
+
+
 # --- Test for parallel implementation ---
 
 def transform_xml_to_tsv_single_threaded(xml_file: Path, output_dir: Path):

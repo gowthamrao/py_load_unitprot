@@ -65,6 +65,16 @@ class DatabaseAdapter(ABC):
         """Retrieves the version of UniProt currently loaded in the DB."""
         pass
 
+    @abstractmethod
+    def log_run_start(self, run_id: str, mode: str, dataset: str) -> None:
+        """Logs the start of a pipeline run."""
+        pass
+
+    @abstractmethod
+    def log_run_end(self, run_id: str, status: str, error_message: str | None = None) -> None:
+        """Logs the end of a pipeline run with its final status."""
+        pass
+
 class PostgresAdapter(DatabaseAdapter):
     def __init__(self, staging_schema: str = "uniprot_staging", production_schema: str = "uniprot_public"):
         self.staging_schema = staging_schema
@@ -88,7 +98,8 @@ class PostgresAdapter(DatabaseAdapter):
         return f"""
         CREATE SCHEMA IF NOT EXISTS {self.staging_schema};
         CREATE TABLE IF NOT EXISTS {self.staging_schema}.py_load_uniprot_metadata ( release_version VARCHAR(255) PRIMARY KEY, release_date DATE, load_timestamp TIMESTAMPTZ DEFAULT NOW(), swissprot_entry_count INTEGER, trembl_entry_count INTEGER );
-        CREATE TABLE IF NOT EXISTS {self.staging_schema}.proteins ( primary_accession VARCHAR(255) PRIMARY KEY, uniprot_id VARCHAR(255), sequence_length INTEGER, molecular_weight INTEGER, created_date DATE, modified_date DATE, comments_data JSONB, features_data JSONB, db_references_data JSONB );
+        CREATE TABLE IF NOT EXISTS {self.staging_schema}.load_history ( id SERIAL PRIMARY KEY, run_id VARCHAR(36), status VARCHAR(50), mode VARCHAR(50), dataset VARCHAR(50), start_time TIMESTAMPTZ, end_time TIMESTAMPTZ, error_message TEXT );
+        CREATE TABLE IF NOT EXISTS {self.staging_schema}.proteins ( primary_accession VARCHAR(255) PRIMARY KEY, uniprot_id VARCHAR(255), sequence_length INTEGER, molecular_weight INTEGER, created_date DATE, modified_date DATE, comments_data JSONB, features_data JSONB, db_references_data JSONB, evidence_data JSONB );
         CREATE TABLE IF NOT EXISTS {self.staging_schema}.sequences ( primary_accession VARCHAR(255) PRIMARY KEY, sequence TEXT, FOREIGN KEY (primary_accession) REFERENCES {self.staging_schema}.proteins(primary_accession) ON DELETE CASCADE );
         CREATE TABLE IF NOT EXISTS {self.staging_schema}.accessions ( protein_accession VARCHAR(255), secondary_accession VARCHAR(255), PRIMARY KEY (protein_accession, secondary_accession), FOREIGN KEY (protein_accession) REFERENCES {self.staging_schema}.proteins(primary_accession) ON DELETE CASCADE );
         CREATE TABLE IF NOT EXISTS {self.staging_schema}.taxonomy ( ncbi_taxid INTEGER PRIMARY KEY, scientific_name VARCHAR(1023), lineage TEXT );
@@ -251,7 +262,8 @@ class PostgresAdapter(DatabaseAdapter):
             modified_date = EXCLUDED.modified_date,
             comments_data = EXCLUDED.comments_data,
             features_data = EXCLUDED.features_data,
-            db_references_data = EXCLUDED.db_references_data;
+            db_references_data = EXCLUDED.db_references_data,
+            evidence_data = EXCLUDED.evidence_data;
         """
         cur.execute(sql)
         print(f"{cur.rowcount} proteins upserted.")
@@ -374,3 +386,46 @@ class PostgresAdapter(DatabaseAdapter):
         except psycopg2.errors.UndefinedTable:
             print(f"[yellow]Metadata table not found in schema '{self.production_schema}'. Database may not be initialized.[/yellow]")
             return None
+
+    def log_run_start(self, run_id: str, mode: str, dataset: str) -> None:
+        """
+        Inserts a new record into the load_history table to mark the start of a run.
+        The log is written to the production schema so it persists.
+        """
+        print(f"Logging pipeline run start for run_id: [cyan]{run_id}[/cyan]")
+        sql = f"""
+        INSERT INTO {self.production_schema}.load_history (
+            run_id, status, mode, dataset, start_time
+        ) VALUES (
+            %(run_id)s, 'STARTED', %(mode)s, %(dataset)s, NOW()
+        );
+        """
+        try:
+            with postgres_connection() as conn, conn.cursor() as cur:
+                # Ensure the production schema and table exist before logging
+                self._create_production_schema_if_not_exists(cur)
+                cur.execute(sql, {"run_id": run_id, "mode": mode, "dataset": dataset})
+                conn.commit()
+        except Exception as e:
+            print(f"[bold red]Failed to log pipeline start: {e}[/bold red]")
+            # We don't re-raise here because logging failure should not stop the main pipeline
+
+    def log_run_end(self, run_id: str, status: str, error_message: str | None = None) -> None:
+        """
+        Updates the corresponding run record in load_history with the final
+        status and end time.
+        """
+        print(f"Logging pipeline run end for run_id: [cyan]{run_id}[/cyan] with status [bold { 'green' if status == 'COMPLETED' else 'red' }]{status}[/bold]")
+        sql = f"""
+        UPDATE {self.production_schema}.load_history
+        SET status = %(status)s,
+            end_time = NOW(),
+            error_message = %(error_message)s
+        WHERE run_id = %(run_id)s;
+        """
+        try:
+            with postgres_connection() as conn, conn.cursor() as cur:
+                cur.execute(sql, {"run_id": run_id, "status": status, "error_message": error_message})
+                conn.commit()
+        except Exception as e:
+            print(f"[bold red]Failed to log pipeline end: {e}[/bold red]")

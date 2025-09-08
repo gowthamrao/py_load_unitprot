@@ -14,7 +14,7 @@ UNIPROT_NAMESPACE = "{http://uniprot.org/uniprot}"
 
 # Dictionary mapping table names to their headers
 TABLE_HEADERS = {
-    "proteins": ["primary_accession", "uniprot_id", "sequence_length", "molecular_weight", "created_date", "modified_date", "comments_data", "features_data", "db_references_data"],
+    "proteins": ["primary_accession", "uniprot_id", "sequence_length", "molecular_weight", "created_date", "modified_date", "comments_data", "features_data", "db_references_data", "evidence_data"],
     "sequences": ["primary_accession", "sequence"],
     "accessions": ["protein_accession", "secondary_accession"],
     "taxonomy": ["ncbi_taxid", "scientific_name", "lineage"],
@@ -102,10 +102,12 @@ def _parse_entry(elem) -> dict[str, list]:
         db_ref for db_ref in elem.findall(_get_tag("dbReference"))
         if db_ref.get("type") not in db_refs_to_exclude
     ])
+    evidence_data = _element_to_json(elem.findall(f".//{_get_tag('evidence')}"))
 
     data["proteins"].append([
         primary_accession, uniprot_id, sequence_length, molecular_weight,
-        created_date, modified_date, comments_data, features_data, db_references_data
+        created_date, modified_date, comments_data, features_data, db_references_data,
+        evidence_data
     ])
     if sequence:
         data["sequences"].append([primary_accession, sequence])

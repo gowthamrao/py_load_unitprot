@@ -11,6 +11,18 @@ class Settings(BaseSettings):
     # --- Local data storage ---
     DATA_DIR: Path = Path("data")
 
+    # --- Database Connection ---
+    POSTGRES_HOST: str = "localhost"
+    POSTGRES_PORT: int = 5432
+    POSTGRES_USER: str = "user"
+    POSTGRES_PASSWORD: str = "password"
+    POSTGRES_DB: str = "uniprot"
+
+    @property
+    def db_connection_string(self) -> str:
+        """Constructs the database connection string."""
+        return f"dbname='{self.POSTGRES_DB}' user='{self.POSTGRES_USER}' host='{self.POSTGRES_HOST}' password='{self.POSTGRES_PASSWORD}' port='{self.POSTGRES_PORT}'"
+
     # --- UniProt URLs ---
     # Base URL for the current UniProt release data
     UNIPROT_FTP_BASE_URL: str = "https://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/complete/"

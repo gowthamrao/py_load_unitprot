@@ -1,12 +1,10 @@
 import typer
 from rich import print
-import tempfile
-from pathlib import Path
-import shutil
 
-from py_load_uniprot import extractor, transformer
+from py_load_uniprot import extractor
 from py_load_uniprot.config import settings
-from py_load_uniprot.db_manager import PostgresAdapter, TABLE_LOAD_ORDER
+from py_load_uniprot.db_manager import PostgresAdapter
+from py_load_uniprot.pipeline import PyLoadUniprotPipeline
 
 app = typer.Typer(
     name="py-load-uniprot",
@@ -36,73 +34,17 @@ def run(
     """
     Run the full ETL pipeline for a specified dataset and load mode.
     """
-    print(f"[bold blue]Starting ETL pipeline run...[/bold blue]")
-    print(f"Dataset: [cyan]{dataset}[/cyan], Mode: [cyan]{mode}[/cyan]")
-
-    if mode not in ['full', 'delta']:
-        print(f"[bold red]Error: Load mode '{mode}' is not valid. Choose 'full' or 'delta'.[/bold red]")
-        raise typer.Exit(code=1)
-
-    if dataset not in ['swissprot', 'trembl']:
-        print(f"[bold red]Error: Dataset '{dataset}' is not valid. Choose 'swissprot' or 'trembl'.[/bold red]")
-        raise typer.Exit(code=1)
-
-    xml_filename = f"uniprot_{dataset}.xml.gz"
-    source_xml_path = settings.DATA_DIR / xml_filename
-
-    db_adapter = PostgresAdapter()
-    temp_dir = None
-
     try:
-        # Step 1: Extraction (fetches metadata, downloads data, verifies checksums)
-        print("\n[bold]Step 1: Running data extraction...[/bold]")
-        release_info = extractor.run_extraction()
-        if not source_xml_path.exists():
-            raise FileNotFoundError(f"Source file not found after extraction: {source_xml_path}")
-        print("[green]Extraction check complete.[/green]")
-
-        # Step 2: Transformation (XML -> TSV.gz)
-        print("\n[bold]Step 2: Running data transformation...[/bold]")
-        temp_dir = Path(tempfile.mkdtemp(prefix="uniprot_etl_"))
-        print(f"Intermediate files will be stored in: {temp_dir}")
-        transformer.transform_xml_to_tsv(source_xml_path, temp_dir)
-        print("[green]Transformation complete.[/green]")
-
-        # Step 3: Database Load (Staging)
-        print("\n[bold]Step 3: Loading data into staging schema...[/bold]")
-        db_adapter.initialize_schema(mode=mode)
-
-        for table_name in TABLE_LOAD_ORDER:
-            file_path = temp_dir / f"{table_name}.tsv.gz"
-            if file_path.exists():
-                print(f"Loading {table_name}...")
-                db_adapter.bulk_load_intermediate(file_path, table_name)
-            else:
-                print(f"[yellow]Warning: No data file for '{table_name}'. Skipping.[/yellow]")
-        print("[green]Staging load complete.[/green]")
-
-        # Step 4: Finalize Load (Index, Analyze, Swap/Merge)
-        print("\n[bold]Step 4: Finalizing database load...[/bold]")
-        db_adapter.finalize_load(mode=mode)
-        print("[green]Finalization complete.[/green]")
-
-        # Step 5: Update Metadata
-        print("\n[bold]Step 5: Updating release metadata...[/bold]")
-        db_adapter.update_metadata(release_info)
-        print("[green]Metadata update complete.[/green]")
-
-        print("\n[bold green]ETL pipeline completed successfully![/bold green]")
-
+        pipeline = PyLoadUniprotPipeline()
+        pipeline.run(dataset=dataset, mode=mode)
+    except (ValueError, FileNotFoundError) as e:
+        print(f"\n[bold red]Configuration Error: {e}[/bold red]")
+        raise typer.Exit(code=1)
     except Exception as e:
-        print(f"\n[bold red]An error occurred during the ETL pipeline: {e}[/bold red]")
+        print(f"\n[bold red]An unexpected error occurred during the ETL pipeline: {e}[/bold red]")
         import traceback
         traceback.print_exc()
         raise typer.Exit(code=1)
-    finally:
-        # Clean up the temporary directory
-        if temp_dir and temp_dir.exists():
-            print(f"Cleaning up temporary directory: {temp_dir}")
-            shutil.rmtree(temp_dir)
 
 
 @app.command()

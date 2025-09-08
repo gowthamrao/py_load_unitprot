@@ -5,6 +5,8 @@ import tempfile
 import shutil
 from pathlib import Path
 from rich import print
+import uuid
+import traceback
 
 from py_load_uniprot import extractor, transformer
 from py_load_uniprot.config import get_settings
@@ -26,6 +28,7 @@ class PyLoadUniprotPipeline:
     def run(self, dataset: str, mode: str):
         """
         Executes the full ETL pipeline for a specified dataset(s) and load mode.
+        Includes comprehensive status logging to the `load_history` table.
 
         Args:
             dataset: The dataset to load ('swissprot', 'trembl', or 'all').
@@ -33,45 +36,60 @@ class PyLoadUniprotPipeline:
 
         Raises:
             ValueError: If the dataset or mode is invalid.
-            Exception: Propagates exceptions from underlying ETL steps.
+            Exception: Propagates exceptions from underlying ETL steps after logging.
         """
-        print(f"[bold blue]Starting ETL pipeline run...[/bold blue]")
+        run_id = str(uuid.uuid4())
+        print(f"[bold blue]Starting ETL pipeline run (ID: {run_id})...[/bold blue]")
         print(f"Dataset: [cyan]{dataset}[/cyan], Mode: [cyan]{mode}[/cyan]")
 
-        if mode not in ['full', 'delta']:
-            raise ValueError(f"Load mode '{mode}' is not valid. Choose 'full' or 'delta'.")
+        try:
+            if mode not in ['full', 'delta']:
+                raise ValueError(f"Load mode '{mode}' is not valid. Choose 'full' or 'delta'.")
 
-        valid_datasets = ['swissprot', 'trembl', 'all']
-        if dataset not in valid_datasets:
-            raise ValueError(f"Dataset '{dataset}' is not valid. Choose from {valid_datasets}.")
+            valid_datasets = ['swissprot', 'trembl', 'all']
+            if dataset not in valid_datasets:
+                raise ValueError(f"Dataset '{dataset}' is not valid. Choose from {valid_datasets}.")
 
-        datasets_to_process = ['swissprot', 'trembl'] if dataset == 'all' else [dataset]
+            # Log the start of the run
+            self.db_adapter.log_run_start(run_id, mode, dataset)
 
-        # Step 1: Extraction (downloads all necessary files at once)
-        print("\n[bold]Step 1: Running data extraction...[/bold]")
-        release_info = extractor.run_extraction()
-        print("[green]Extraction complete.[/green]")
+            datasets_to_process = ['swissprot', 'trembl'] if dataset == 'all' else [dataset]
 
-        # Step 2: Initialize Schema (once for the entire run)
-        print("\n[bold]Step 2: Initializing database schema...[/bold]")
-        self.db_adapter.initialize_schema(mode=mode)
-        print("[green]Schema initialization complete.[/green]")
+            # Step 1: Extraction
+            print("\n[bold]Step 1: Running data extraction...[/bold]")
+            release_info = extractor.run_extraction()
+            print("[green]Extraction complete.[/green]")
 
-        # Step 3: Loop through datasets for Transformation and Loading
-        for ds in datasets_to_process:
-            self._transform_and_load_single_dataset(ds)
+            # Step 2: Initialize Schema
+            print("\n[bold]Step 2: Initializing database schema...[/bold]")
+            self.db_adapter.initialize_schema(mode=mode)
+            print("[green]Schema initialization complete.[/green]")
 
-        # Step 4: Finalize Load (once for the entire run)
-        print("\n[bold]Step 4: Finalizing database load...[/bold]")
-        self.db_adapter.finalize_load(mode=mode)
-        print("[green]Finalization complete.[/green]")
+            # Step 3: Transform and Load each dataset
+            for ds in datasets_to_process:
+                self._transform_and_load_single_dataset(ds)
 
-        # Step 5: Update Metadata
-        print("\n[bold]Step 5: Updating release metadata...[/bold]")
-        self.db_adapter.update_metadata(release_info)
-        print("[green]Metadata update complete.[/green]")
+            # Step 4: Finalize Load
+            print("\n[bold]Step 4: Finalizing database load...[/bold]")
+            self.db_adapter.finalize_load(mode=mode)
+            print("[green]Finalization complete.[/green]")
 
-        print("\n[bold green]ETL pipeline completed successfully![/bold green]")
+            # Step 5: Update Metadata
+            print("\n[bold]Step 5: Updating release metadata...[/bold]")
+            self.db_adapter.update_metadata(release_info)
+            print("[green]Metadata update complete.[/green]")
+
+            # If we reach here, the pipeline was successful
+            self.db_adapter.log_run_end(run_id, "COMPLETED")
+            print("\n[bold green]ETL pipeline completed successfully![/bold green]")
+
+        except Exception as e:
+            # Capture the full error traceback for detailed logging
+            error_msg = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+            print(f"[bold red]\nETL pipeline failed: {error_msg}[/bold red]")
+            # Log the failure and then re-raise the exception
+            self.db_adapter.log_run_end(run_id, "FAILED", error_message=error_msg)
+            raise
 
     def _transform_and_load_single_dataset(self, dataset: str):
         """

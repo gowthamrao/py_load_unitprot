@@ -4,7 +4,7 @@ from pathlib import Path
 import requests
 
 from py_load_uniprot import extractor
-from py_load_uniprot.config import settings
+from py_load_uniprot.config import Settings, initialize_settings, get_settings
 
 # A known MD5 hash for the content "hello world"
 HELLO_WORLD_CONTENT = b"hello world"
@@ -17,11 +17,17 @@ bad_hash_value  uniprot_trembl.xml.gz
 
 @pytest.fixture
 def mock_settings(tmp_path):
-    """Fixture to override the DATA_DIR setting to use a temporary directory."""
-    original_data_dir = settings.DATA_DIR
-    settings.DATA_DIR = tmp_path / "data"
-    yield settings
-    settings.DATA_DIR = original_data_dir
+    """
+    Fixture to initialize settings for tests, pointing data_dir to a temp path.
+    This ensures that each test runs in an isolated directory.
+    """
+    test_data_dir = tmp_path / "data"
+    test_settings = Settings(data_dir=test_data_dir)
+    initialize_settings(config_file=None) # Start with default
+    # Monkeypatch the global settings instance for the duration of the test
+    with patch('py_load_uniprot.config._settings_instance', test_settings):
+        yield get_settings()
+
 
 def test_calculate_md5(tmp_path):
     """
@@ -36,7 +42,7 @@ def test_calculate_md5(tmp_path):
     # Assert
     assert calculated_hash == HELLO_WORLD_MD5
 
-def test_get_release_checksums_success():
+def test_get_release_checksums_success(mock_settings):
     """
     Tests that get_release_checksums correctly parses valid checksum data.
     """
@@ -46,6 +52,7 @@ def test_get_release_checksums_success():
     mock_response.status_code = 200
     mock_response.text = MOCK_CHECKSUM_DATA
     mock_session.get.return_value = mock_response
+    settings = get_settings()
 
     # Act
     checksums = extractor.get_release_checksums(mock_session)
@@ -55,10 +62,10 @@ def test_get_release_checksums_success():
     assert checksums["uniprot_sprot.xml.gz"] == HELLO_WORLD_MD5
     assert "uniprot_trembl.xml.gz" in checksums
     assert checksums["uniprot_trembl.xml.gz"] == "bad_hash_value"
-    mock_session.get.assert_called_once_with(settings.checksums_url)
+    mock_session.get.assert_called_once_with(settings.urls.checksums_url)
 
 
-def test_get_release_checksums_failure():
+def test_get_release_checksums_failure(mock_settings):
     """
     Tests that get_release_checksums raises an exception on network failure.
     """
@@ -127,9 +134,10 @@ def test_run_extraction_skips_existing_valid_file(mock_calculate_md5, mock_downl
     Tests that run_extraction skips one file and re-downloads another on mismatch.
     """
     # Arrange
-    sprot_file = mock_settings.DATA_DIR / "uniprot_sprot.xml.gz"
-    trembl_file = mock_settings.DATA_DIR / "uniprot_trembl.xml.gz"
-    mock_settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    settings = get_settings()
+    sprot_file = settings.data_dir / "uniprot_sprot.xml.gz"
+    trembl_file = settings.data_dir / "uniprot_trembl.xml.gz"
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
     sprot_file.touch()
     trembl_file.touch()
 
@@ -149,7 +157,7 @@ def test_run_extraction_skips_existing_valid_file(mock_calculate_md5, mock_downl
     # Assert
     # Download should be called only for the trembl file.
     assert mock_download.call_count == 1
-    mock_download.assert_called_once_with(ANY, settings.trembl_xml_url, trembl_file)
+    mock_download.assert_called_once_with(ANY, settings.urls.trembl_xml_url, trembl_file)
 
     # Checksum calculated for sprot (pass), then trembl (fail), then trembl again (pass).
     assert mock_calculate_md5.call_count == 3

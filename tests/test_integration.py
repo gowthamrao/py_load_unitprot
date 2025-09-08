@@ -8,8 +8,17 @@ from py_load_uniprot import transformer
 from py_load_uniprot.cli import app
 from py_load_uniprot.db_manager import PostgresAdapter, postgres_connection, TABLE_LOAD_ORDER
 import datetime
+from testcontainers.postgres import PostgresContainer
 
 runner = CliRunner()
+
+@pytest.fixture(scope="session")
+def postgres_container():
+    """
+    Spins up a PostgreSQL container for the entire test session.
+    """
+    with PostgresContainer("postgres:15-alpine") as postgres:
+        yield postgres
 
 # A more comprehensive XML sample for integration testing
 SAMPLE_XML_CONTENT = """<?xml version="1.0" encoding="UTF-8"?>
@@ -60,9 +69,20 @@ def sample_xml_file(tmp_path: Path) -> Path:
     return xml_path
 
 @pytest.fixture
-def db_adapter() -> PostgresAdapter:
+def mock_db_settings(mocker, postgres_container: PostgresContainer):
     """
-    Provides a PostgresAdapter configured for integration testing and handles cleanup.
+    Mocks the database connection string to point to the test container.
+    """
+    conn_url = postgres_container.get_connection_url()
+    mocker.patch.object(settings, 'db_connection_string', conn_url)
+    yield conn_url
+
+
+@pytest.fixture
+def db_adapter(mock_db_settings) -> PostgresAdapter:
+    """
+    Provides a PostgresAdapter configured for integration testing against the testcontainer
+    and handles cleanup.
     """
     adapter = PostgresAdapter(
         staging_schema="integration_test_staging",
@@ -244,6 +264,68 @@ def test_delta_load_pipeline(sample_xml_file: Path, sample_xml_v2_file: Path, db
         # Check that metadata was updated to V2
         cur.execute(f"SELECT release_version FROM {db_adapter.production_schema}.py_load_uniprot_metadata")
         assert cur.fetchone()[0] == 'V2_TEST'
+
+
+from py_load_uniprot.pipeline import PyLoadUniprotPipeline
+from py_load_uniprot.config import settings
+
+
+def test_pipeline_api_full_load(db_adapter: PostgresAdapter, sample_xml_file: Path, tmp_path: Path, mocker):
+    """
+    Tests that the public PyLoadUniprotPipeline API correctly runs a full load.
+    This test mocks the extraction and transformation steps to focus on the pipeline's
+    orchestration and loading logic.
+    """
+    # Arrange
+    # Point the settings to our temporary test data directory
+    mocker.patch.object(settings, 'DATA_DIR', tmp_path)
+    # The pipeline expects the file to be named correctly
+    test_sprot_path = tmp_path / "uniprot_swissprot.xml.gz"
+    with gzip.open(sample_xml_file, 'rb') as f_in, gzip.open(test_sprot_path, 'wb') as f_out:
+        f_out.writelines(f_in)
+
+    # Mock the extractor to prevent network calls and return controlled metadata
+    mock_release_info = {
+        "release_version": "API_TEST",
+        "release_date": datetime.date(2025, 3, 15),
+        "swissprot_entry_count": 2,
+        "trembl_entry_count": 0,
+    }
+    mocker.patch("py_load_uniprot.extractor.run_extraction", return_value=mock_release_info)
+
+    # The pipeline's `run` method internally calls the transformer.
+    # For this test, we want to control the input to the loader, so we run the
+    # transformation once ourselves to generate the files.
+    # The loader part of the pipeline will then use these generated files.
+    transformer.transform_xml_to_tsv(test_sprot_path, tmp_path)
+
+    # We then mock the transformer within the pipeline run itself to avoid re-running it
+    # and to isolate the test to the pipeline's orchestration logic.
+    mocker.patch("py_load_uniprot.transformer.transform_xml_to_tsv", return_value=None)
+
+
+    # --- Act ---
+    # Instantiate the pipeline and run it
+    pipeline = PyLoadUniprotPipeline()
+    # We need to manually override the adapter to use our test-specific schema names
+    pipeline.db_adapter = db_adapter
+    pipeline.run(dataset="swissprot", mode="full")
+
+    # --- Assert ---
+    with postgres_connection() as conn, conn.cursor() as cur:
+        # Assert schema and table structure
+        cur.execute("SELECT 1 FROM pg_namespace WHERE nspname = %s", (db_adapter.production_schema,))
+        assert cur.fetchone() is not None, "Production schema should exist after pipeline run"
+
+        # Assert data integrity
+        cur.execute(f"SELECT COUNT(*) FROM {db_adapter.production_schema}.proteins")
+        assert cur.fetchone()[0] == 2, "There should be 2 proteins loaded"
+        cur.execute(f"SELECT uniprot_id FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P67890'")
+        assert cur.fetchone()[0] == 'TEST2_MOUSE'
+
+        # Assert Metadata
+        cur.execute(f"SELECT release_version FROM {db_adapter.production_schema}.py_load_uniprot_metadata")
+        assert cur.fetchone()[0] == "API_TEST"
 
 
 def test_status_command_reporting(db_adapter: PostgresAdapter, sample_xml_file: Path, tmp_path: Path):

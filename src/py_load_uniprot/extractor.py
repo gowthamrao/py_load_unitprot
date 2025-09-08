@@ -1,6 +1,9 @@
 import hashlib
 import requests
 from pathlib import Path
+import time
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from rich.progress import (
     Progress,
     BarColumn,
@@ -14,9 +17,30 @@ from datetime import datetime
 
 from py_load_uniprot.config import settings
 
-def get_release_metadata() -> dict[str, any]:
+
+def _create_retry_session() -> requests.Session:
+    """
+    Creates a requests session with a retry strategy.
+    This helps in handling transient network errors gracefully.
+    """
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=5,
+        backoff_factor=1,  # Will sleep for {backoff factor} * (2 ** ({number of total retries} - 1))
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "OPTIONS"],
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+def get_release_metadata(session: requests.Session) -> dict[str, any]:
     """
     Fetches and parses the UniProt release notes file (reldate.txt).
+
+    Args:
+        session: The requests.Session to use for the request.
 
     Returns:
         A dictionary containing release metadata (version, date).
@@ -26,7 +50,7 @@ def get_release_metadata() -> dict[str, any]:
         ValueError: If the release notes format is unexpected.
     """
     print(f"Fetching release metadata from [cyan]{settings.release_notes_url}[/cyan]...")
-    response = requests.get(settings.release_notes_url)
+    response = session.get(settings.release_notes_url)
     response.raise_for_status()
     content = response.text
 
@@ -63,9 +87,12 @@ def get_release_metadata() -> dict[str, any]:
     print(f"[green]Found UniProt Release: {release_version} ({release_date})[/green]")
     return metadata
 
-def get_release_checksums() -> dict[str, str]:
+def get_release_checksums(session: requests.Session) -> dict[str, str]:
     """
     Fetches and parses the MD5 checksum file from UniProt.
+
+    Args:
+        session: The requests.Session to use for the request.
 
     Returns:
         A dictionary mapping filenames to their expected MD5 checksums.
@@ -74,7 +101,7 @@ def get_release_checksums() -> dict[str, str]:
         requests.exceptions.RequestException: If the checksum file cannot be downloaded.
     """
     print(f"Fetching checksums from [cyan]{settings.checksums_url}[/cyan]...")
-    response = requests.get(settings.checksums_url)
+    response = session.get(settings.checksums_url)
     response.raise_for_status()
 
     checksums = {}
@@ -104,18 +131,20 @@ def calculate_md5(filepath: Path, chunk_size: int = 8192) -> str:
             md5.update(chunk)
     return md5.hexdigest()
 
-def download_uniprot_file(url: str, destination: Path) -> None:
+def download_uniprot_file(session: requests.Session, url: str, destination: Path) -> None:
     """
     Downloads a file from a URL to a destination, showing a rich progress bar.
+    This function uses a session object to enable connection pooling and retries.
 
     Args:
+        session: The requests.Session object to use for the download.
         url: The URL of the file to download.
         destination: The local path to save the file.
 
     Raises:
-        requests.exceptions.RequestException: If the file cannot be downloaded.
+        requests.exceptions.RequestException: If the file cannot be downloaded after retries.
     """
-    response = requests.get(url, stream=True)
+    response = session.get(url, stream=True)
     response.raise_for_status()
 
     total_size = int(response.headers.get("content-length", 0))
@@ -151,10 +180,11 @@ def run_extraction() -> dict[str, any]:
                       downloaded file has a checksum mismatch.
     """
     print("[bold blue]Starting UniProt data extraction...[/bold blue]")
+    session = _create_retry_session()
 
     # 1. Get release metadata first, as it's the source of truth for the release version
     try:
-        release_metadata = get_release_metadata()
+        release_metadata = get_release_metadata(session)
     except (requests.exceptions.RequestException, ValueError) as e:
         raise RuntimeError(f"Failed to get release metadata: {e}") from e
 
@@ -164,7 +194,7 @@ def run_extraction() -> dict[str, any]:
 
     # 3. Get official checksums
     try:
-        checksums = get_release_checksums()
+        checksums = get_release_checksums(session)
     except requests.exceptions.RequestException as e:
         raise RuntimeError(f"Failed to fetch checksums from {settings.checksums_url}") from e
 
@@ -174,7 +204,7 @@ def run_extraction() -> dict[str, any]:
         "uniprot_trembl.xml.gz": settings.trembl_xml_url,
     }
 
-    # 4. Download and verify each file
+    # 5. Download and verify each file
     for filename, url in files_to_download.items():
         destination = settings.DATA_DIR / filename
         print(f"\n[bold]Processing {filename}...[/bold]")
@@ -195,9 +225,9 @@ def run_extraction() -> dict[str, any]:
 
         # Download the file
         try:
-            download_uniprot_file(url, destination)
+            download_uniprot_file(session, url, destination)
         except requests.exceptions.RequestException as e:
-            raise RuntimeError(f"Failed to download {filename} from {url}") from e
+            raise RuntimeError(f"Failed to download {filename} from {url} after multiple retries") from e
 
         # Verify checksum after download
         if expected_checksum:

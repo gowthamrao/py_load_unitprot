@@ -30,13 +30,29 @@ def postgres_connection():
 
 class DatabaseAdapter(ABC):
     @abstractmethod
-    def initialize_schema(self) -> None: pass
+    def initialize_schema(self, mode: str) -> None:
+        """Prepares the database schema (e.g., main tables or staging schema)."""
+        pass
+
     @abstractmethod
-    def load_transformed_data(self, intermediate_dir: Path) -> None: pass
+    def bulk_load_intermediate(self, file_path: Path, table_name: str) -> None:
+        """Executes the native bulk load operation for a specific file."""
+        pass
+
     @abstractmethod
-    def finalize_load(self, mode: str) -> None: pass
+    def finalize_load(self, mode: str) -> None:
+        """Performs post-load operations (e.g., indexing, analyzing, schema swapping, MERGE execution)."""
+        pass
+
     @abstractmethod
-    def get_current_release_version(self) -> str | None: pass
+    def update_metadata(self, release_info: dict) -> None:
+        """Updates the internal metadata tables."""
+        pass
+
+    @abstractmethod
+    def get_current_release_version(self) -> str | None:
+        """Retrieves the version of UniProt currently loaded in the DB."""
+        pass
 
 class PostgresAdapter(DatabaseAdapter):
     def __init__(self, staging_schema: str = "uniprot_staging", production_schema: str = "uniprot_public"):
@@ -48,15 +64,15 @@ class PostgresAdapter(DatabaseAdapter):
         # Same as before, but good to have it defined once
         return f"""
         CREATE SCHEMA IF NOT EXISTS {self.staging_schema};
-        CREATE TABLE {self.staging_schema}.py_load_uniprot_metadata ( release_version VARCHAR(255) PRIMARY KEY, release_date DATE, load_timestamp TIMESTAMPTZ DEFAULT NOW(), swissprot_entry_count INTEGER, trembl_entry_count INTEGER );
-        CREATE TABLE {self.staging_schema}.proteins ( primary_accession VARCHAR(255) PRIMARY KEY, uniprot_id VARCHAR(255), sequence_length INTEGER, molecular_weight INTEGER, created_date DATE, modified_date DATE, comments_data JSONB, features_data JSONB, db_references_data JSONB );
-        CREATE TABLE {self.staging_schema}.sequences ( primary_accession VARCHAR(255) PRIMARY KEY, sequence TEXT, FOREIGN KEY (primary_accession) REFERENCES {self.staging_schema}.proteins(primary_accession) ON DELETE CASCADE );
-        CREATE TABLE {self.staging_schema}.accessions ( protein_accession VARCHAR(255), secondary_accession VARCHAR(255), PRIMARY KEY (protein_accession, secondary_accession), FOREIGN KEY (protein_accession) REFERENCES {self.staging_schema}.proteins(primary_accession) ON DELETE CASCADE );
-        CREATE TABLE {self.staging_schema}.taxonomy ( ncbi_taxid INTEGER PRIMARY KEY, scientific_name VARCHAR(1023), lineage TEXT );
-        CREATE TABLE {self.staging_schema}.genes ( protein_accession VARCHAR(255), gene_name VARCHAR(255), is_primary BOOLEAN, PRIMARY KEY (protein_accession, gene_name), FOREIGN KEY (protein_accession) REFERENCES {self.staging_schema}.proteins(primary_accession) ON DELETE CASCADE );
-        CREATE TABLE {self.staging_schema}.keywords ( protein_accession VARCHAR(255), keyword_id VARCHAR(255), keyword_label VARCHAR(255), PRIMARY KEY (protein_accession, keyword_id), FOREIGN KEY (protein_accession) REFERENCES {self.staging_schema}.proteins(primary_accession) ON DELETE CASCADE );
-        CREATE TABLE {self.staging_schema}.protein_to_go ( protein_accession VARCHAR(255), go_term_id VARCHAR(255), PRIMARY KEY (protein_accession, go_term_id), FOREIGN KEY (protein_accession) REFERENCES {self.staging_schema}.proteins(primary_accession) ON DELETE CASCADE );
-        CREATE TABLE {self.staging_schema}.protein_to_taxonomy ( protein_accession VARCHAR(255), ncbi_taxid INTEGER, PRIMARY KEY (protein_accession, ncbi_taxid), FOREIGN KEY (protein_accession) REFERENCES {self.staging_schema}.proteins(primary_accession) ON DELETE CASCADE, FOREIGN KEY (ncbi_taxid) REFERENCES {self.staging_schema}.taxonomy(ncbi_taxid) );
+        CREATE TABLE IF NOT EXISTS {self.staging_schema}.py_load_uniprot_metadata ( release_version VARCHAR(255) PRIMARY KEY, release_date DATE, load_timestamp TIMESTAMPTZ DEFAULT NOW(), swissprot_entry_count INTEGER, trembl_entry_count INTEGER );
+        CREATE TABLE IF NOT EXISTS {self.staging_schema}.proteins ( primary_accession VARCHAR(255) PRIMARY KEY, uniprot_id VARCHAR(255), sequence_length INTEGER, molecular_weight INTEGER, created_date DATE, modified_date DATE, comments_data JSONB, features_data JSONB, db_references_data JSONB );
+        CREATE TABLE IF NOT EXISTS {self.staging_schema}.sequences ( primary_accession VARCHAR(255) PRIMARY KEY, sequence TEXT, FOREIGN KEY (primary_accession) REFERENCES {self.staging_schema}.proteins(primary_accession) ON DELETE CASCADE );
+        CREATE TABLE IF NOT EXISTS {self.staging_schema}.accessions ( protein_accession VARCHAR(255), secondary_accession VARCHAR(255), PRIMARY KEY (protein_accession, secondary_accession), FOREIGN KEY (protein_accession) REFERENCES {self.staging_schema}.proteins(primary_accession) ON DELETE CASCADE );
+        CREATE TABLE IF NOT EXISTS {self.staging_schema}.taxonomy ( ncbi_taxid INTEGER PRIMARY KEY, scientific_name VARCHAR(1023), lineage TEXT );
+        CREATE TABLE IF NOT EXISTS {self.staging_schema}.genes ( protein_accession VARCHAR(255), gene_name VARCHAR(255), is_primary BOOLEAN, PRIMARY KEY (protein_accession, gene_name), FOREIGN KEY (protein_accession) REFERENCES {self.staging_schema}.proteins(primary_accession) ON DELETE CASCADE );
+        CREATE TABLE IF NOT EXISTS {self.staging_schema}.keywords ( protein_accession VARCHAR(255), keyword_id VARCHAR(255), keyword_label VARCHAR(255), PRIMARY KEY (protein_accession, keyword_id), FOREIGN KEY (protein_accession) REFERENCES {self.staging_schema}.proteins(primary_accession) ON DELETE CASCADE );
+        CREATE TABLE IF NOT EXISTS {self.staging_schema}.protein_to_go ( protein_accession VARCHAR(255), go_term_id VARCHAR(255), PRIMARY KEY (protein_accession, go_term_id), FOREIGN KEY (protein_accession) REFERENCES {self.staging_schema}.proteins(primary_accession) ON DELETE CASCADE );
+        CREATE TABLE IF NOT EXISTS {self.staging_schema}.protein_to_taxonomy ( protein_accession VARCHAR(255), ncbi_taxid INTEGER, PRIMARY KEY (protein_accession, ncbi_taxid), FOREIGN KEY (protein_accession) REFERENCES {self.staging_schema}.proteins(primary_accession) ON DELETE CASCADE, FOREIGN KEY (ncbi_taxid) REFERENCES {self.staging_schema}.taxonomy(ncbi_taxid) );
         """
 
     def _get_indexes_ddl(self) -> str:
@@ -75,23 +91,21 @@ class PostgresAdapter(DatabaseAdapter):
         CREATE INDEX IF NOT EXISTS idx_proteins_db_refs_gin ON {self.staging_schema}.proteins USING GIN (db_references_data);
         """
 
-    def initialize_schema(self) -> None:
-        print(f"Initializing database schema in [cyan]'{self.staging_schema}'[/cyan]...")
+    def initialize_schema(self, mode: str) -> None:
+        print(f"Initializing database schema in [cyan]'{self.staging_schema}'[/cyan] for mode '{mode}'...")
         with postgres_connection() as conn, conn.cursor() as cur:
+            # In both full and delta modes, we start with a clean staging schema
             cur.execute(f"DROP SCHEMA IF EXISTS {self.staging_schema} CASCADE;")
             cur.execute(self._get_schema_ddl())
             conn.commit()
         print("[green]Staging schema initialized successfully.[/green]")
 
-    def load_transformed_data(self, intermediate_dir: Path) -> None:
-        for table_name in TABLE_LOAD_ORDER:
-            file_path = intermediate_dir / f"{table_name}.tsv.gz"
-            if file_path.exists():
-                self._bulk_load_intermediate(file_path, table_name)
-            else:
-                print(f"[yellow]Warning: No data file for '{table_name}'. Skipping.[/yellow]")
-
-    def _bulk_load_intermediate(self, file_path: Path, table_name: str):
+    def bulk_load_intermediate(self, file_path: Path, table_name: str):
+        """
+        Loads a single intermediate TSV.gz file into a table in the staging schema.
+        This implementation dispatches to a direct COPY or a safe UPSERT based
+        on whether the table has unique constraints that need handling.
+        """
         unique_key = TABLES_WITH_UNIQUE_CONSTRAINTS.get(table_name)
         if unique_key:
             self._safe_upsert_load(file_path, table_name, unique_key)
@@ -290,6 +304,50 @@ class PostgresAdapter(DatabaseAdapter):
         cur.execute(delete_sql, (deleted_accessions,))
         print(f"{cur.rowcount} proteins and their related data deleted from production.")
 
+    def update_metadata(self, release_info: dict) -> None:
+        """
+        Updates the metadata table with the new release information.
+        This should be called after a successful load and schema swap.
+        """
+        print(f"Updating metadata for release [cyan]{release_info['release_version']}[/cyan]...")
+        # This table should only ever contain one row: the current release.
+        # We truncate it before inserting the new record to enforce this.
+        truncate_sql = f"TRUNCATE TABLE {self.production_schema}.py_load_uniprot_metadata;"
+        insert_sql = f"""
+        INSERT INTO {self.production_schema}.py_load_uniprot_metadata (
+            release_version,
+            release_date,
+            swissprot_entry_count,
+            trembl_entry_count
+        ) VALUES (
+            %(release_version)s,
+            %(release_date)s,
+            %(swissprot_entry_count)s,
+            %(trembl_entry_count)s
+        );
+        """
+        with postgres_connection() as conn, conn.cursor() as cur:
+            cur.execute(truncate_sql)
+            cur.execute(insert_sql, release_info)
+            conn.commit()
+        print("[green]Metadata table updated successfully.[/green]")
+
+
     def get_current_release_version(self) -> str | None:
-        print("[yellow]Get current release version not yet implemented.[/yellow]")
-        return None
+        """Retrieves the version of UniProt currently loaded in the production DB."""
+        print(f"Checking for current release version in schema [cyan]'{self.production_schema}'[/cyan]...")
+        sql = f"SELECT release_version FROM {self.production_schema}.py_load_uniprot_metadata ORDER BY load_timestamp DESC LIMIT 1;"
+        try:
+            with postgres_connection() as conn, conn.cursor() as cur:
+                cur.execute(sql)
+                result = cur.fetchone()
+                if result:
+                    version = result[0]
+                    print(f"[green]Found current release version: {version}[/green]")
+                    return version
+                else:
+                    print("[yellow]No release version found in metadata table.[/yellow]")
+                    return None
+        except psycopg2.errors.UndefinedTable:
+            print(f"[yellow]Metadata table not found in schema '{self.production_schema}'. Database may not be initialized.[/yellow]")
+            return None

@@ -9,8 +9,59 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 from rich import print
+import re
+from datetime import datetime
 
 from py_load_uniprot.config import settings
+
+def get_release_metadata() -> dict[str, any]:
+    """
+    Fetches and parses the UniProt release notes file (reldate.txt).
+
+    Returns:
+        A dictionary containing release metadata (version, date).
+
+    Raises:
+        requests.exceptions.RequestException: If the release notes file cannot be downloaded.
+        ValueError: If the release notes format is unexpected.
+    """
+    print(f"Fetching release metadata from [cyan]{settings.release_notes_url}[/cyan]...")
+    response = requests.get(settings.release_notes_url)
+    response.raise_for_status()
+    content = response.text
+
+    # Example reldate.txt content:
+    # Release 2024_02 of 21-Feb-2024
+    # UniProt Knowledgebase
+    # Copyright (...)
+    #
+    # Swiss-Prot Release 2024_02 of 21-Feb-2024 contains 571168 sequence entries
+    # TrEMBL Release 2024_02 of 21-Feb-2024 contains 269075841 sequence entries
+
+    # Use regex to find the main release line
+    match = re.search(r"Release (\d{4}_\d{2}) of (\d{2}-\w{3}-\d{4})", content)
+    if not match:
+        raise ValueError("Could not parse release version and date from reldate.txt")
+
+    release_version = match.group(1)
+    release_date_str = match.group(2)
+    release_date = datetime.strptime(release_date_str, "%d-%b-%Y").date()
+
+    # Optional: Extract entry counts
+    swissprot_match = re.search(r"Swiss-Prot.*contains (\d+) sequence entries", content)
+    trembl_match = re.search(r"TrEMBL.*contains (\d+) sequence entries", content)
+
+    swissprot_count = int(swissprot_match.group(1)) if swissprot_match else None
+    trembl_count = int(trembl_match.group(1)) if trembl_match else None
+
+    metadata = {
+        "release_version": release_version,
+        "release_date": release_date,
+        "swissprot_entry_count": swissprot_count,
+        "trembl_entry_count": trembl_count,
+    }
+    print(f"[green]Found UniProt Release: {release_version} ({release_date})[/green]")
+    return metadata
 
 def get_release_checksums() -> dict[str, str]:
     """
@@ -84,32 +135,40 @@ def download_uniprot_file(url: str, destination: Path) -> None:
                 f.write(chunk)
                 progress.update(task, advance=len(chunk))
 
-def run_extraction():
+def run_extraction() -> dict[str, any]:
     """
     Orchestrates the entire data extraction process.
 
-    This function ensures the data directory exists, fetches the official checksums,
-    downloads the required UniProt data files, and verifies their integrity using
-    MD5 checksums. It is idempotent, meaning it will skip downloading files that
-    already exist and have a valid checksum.
+    This function ensures the data directory exists, fetches release metadata,
+    fetches official checksums, downloads the required UniProt data files, and
+    verifies their integrity. It is idempotent.
+
+    Returns:
+        A dictionary containing the release metadata.
 
     Raises:
-        RuntimeError: If checksums cannot be fetched or if a downloaded file
-                      has a checksum mismatch.
+        RuntimeError: If metadata/checksums cannot be fetched or if a
+                      downloaded file has a checksum mismatch.
     """
     print("[bold blue]Starting UniProt data extraction...[/bold blue]")
 
-    # 1. Ensure data directory exists
+    # 1. Get release metadata first, as it's the source of truth for the release version
+    try:
+        release_metadata = get_release_metadata()
+    except (requests.exceptions.RequestException, ValueError) as e:
+        raise RuntimeError(f"Failed to get release metadata: {e}") from e
+
+    # 2. Ensure data directory exists
     settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
     print(f"Data will be stored in: [green]{settings.DATA_DIR.resolve()}[/green]")
 
-    # 2. Get official checksums
+    # 3. Get official checksums
     try:
         checksums = get_release_checksums()
     except requests.exceptions.RequestException as e:
         raise RuntimeError(f"Failed to fetch checksums from {settings.checksums_url}") from e
 
-    # 3. Define files to download
+    # 4. Define files to download
     files_to_download = {
         "uniprot_sprot.xml.gz": settings.swissprot_xml_url,
         "uniprot_trembl.xml.gz": settings.trembl_xml_url,
@@ -155,3 +214,4 @@ def run_extraction():
                 )
 
     print("\n[bold blue]Extraction process completed successfully.[/bold blue]")
+    return release_metadata

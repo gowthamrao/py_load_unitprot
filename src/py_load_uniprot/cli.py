@@ -6,7 +6,7 @@ import shutil
 
 from py_load_uniprot import extractor, transformer
 from py_load_uniprot.config import settings
-from py_load_uniprot.db_manager import PostgresAdapter
+from py_load_uniprot.db_manager import PostgresAdapter, TABLE_LOAD_ORDER
 
 app = typer.Typer(
     name="py-load-uniprot",
@@ -54,29 +54,42 @@ def run(
     temp_dir = None
 
     try:
-        # Step 1: Extraction (ensures file is downloaded and valid)
+        # Step 1: Extraction (fetches metadata, downloads data, verifies checksums)
         print("\n[bold]Step 1: Running data extraction...[/bold]")
-        extractor.run_extraction() # This is idempotent, so it's safe to run
+        release_info = extractor.run_extraction()
         if not source_xml_path.exists():
             raise FileNotFoundError(f"Source file not found after extraction: {source_xml_path}")
         print("[green]Extraction check complete.[/green]")
 
-        # Step 2: Transformation
+        # Step 2: Transformation (XML -> TSV.gz)
         print("\n[bold]Step 2: Running data transformation...[/bold]")
         temp_dir = Path(tempfile.mkdtemp(prefix="uniprot_etl_"))
         print(f"Intermediate files will be stored in: {temp_dir}")
         transformer.transform_xml_to_tsv(source_xml_path, temp_dir)
         print("[green]Transformation complete.[/green]")
 
-        # Step 3: Database Load
-        print("\n[bold]Step 3: Running database load...[/bold]")
-        # 3a: Initialize staging schema
-        db_adapter.initialize_schema()
-        # 3b: Load intermediate data
-        db_adapter.load_transformed_data(temp_dir)
-        # 3c: Finalize (index and swap)
+        # Step 3: Database Load (Staging)
+        print("\n[bold]Step 3: Loading data into staging schema...[/bold]")
+        db_adapter.initialize_schema(mode=mode)
+
+        for table_name in TABLE_LOAD_ORDER:
+            file_path = temp_dir / f"{table_name}.tsv.gz"
+            if file_path.exists():
+                print(f"Loading {table_name}...")
+                db_adapter.bulk_load_intermediate(file_path, table_name)
+            else:
+                print(f"[yellow]Warning: No data file for '{table_name}'. Skipping.[/yellow]")
+        print("[green]Staging load complete.[/green]")
+
+        # Step 4: Finalize Load (Index, Analyze, Swap/Merge)
+        print("\n[bold]Step 4: Finalizing database load...[/bold]")
         db_adapter.finalize_load(mode=mode)
-        print("[green]Database load complete.[/green]")
+        print("[green]Finalization complete.[/green]")
+
+        # Step 5: Update Metadata
+        print("\n[bold]Step 5: Updating release metadata...[/bold]")
+        db_adapter.update_metadata(release_info)
+        print("[green]Metadata update complete.[/green]")
 
         print("\n[bold green]ETL pipeline completed successfully![/bold green]")
 
@@ -90,6 +103,23 @@ def run(
         if temp_dir and temp_dir.exists():
             print(f"Cleaning up temporary directory: {temp_dir}")
             shutil.rmtree(temp_dir)
+
+@app.command()
+def status():
+    """
+    Checks and displays the currently loaded UniProt release version in the database.
+    """
+    print("[bold blue]Checking database status...[/bold blue]")
+    try:
+        db_adapter = PostgresAdapter()
+        version = db_adapter.get_current_release_version()
+        if version:
+            print(f"  [bold]Currently loaded UniProt Release Version:[/bold] [green]{version}[/green]")
+        else:
+            print("  [yellow]No UniProt release is currently loaded in the database.[/yellow]")
+    except Exception as e:
+        print(f"\n[bold red]An error occurred while checking the status: {e}[/bold red]")
+        raise typer.Exit(code=1)
 
 def main():
     app()

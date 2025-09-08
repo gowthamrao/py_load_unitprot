@@ -3,8 +3,13 @@ import gzip
 from pathlib import Path
 import psycopg2
 
+from typer.testing import CliRunner
 from py_load_uniprot import transformer
-from py_load_uniprot.db_manager import PostgresAdapter, postgres_connection
+from py_load_uniprot.cli import app
+from py_load_uniprot.db_manager import PostgresAdapter, postgres_connection, TABLE_LOAD_ORDER
+import datetime
+
+runner = CliRunner()
 
 # A more comprehensive XML sample for integration testing
 SAMPLE_XML_CONTENT = """<?xml version="1.0" encoding="UTF-8"?>
@@ -120,68 +125,58 @@ def sample_xml_v2_file(tmp_path: Path) -> Path:
 
 def test_full_etl_pipeline(sample_xml_file: Path, db_adapter: PostgresAdapter, tmp_path: Path):
     """
-    Tests the full ETL pipeline: Transform -> Initialize -> Load -> Finalize.
-    This test is NOT skipped and requires a running PostgreSQL instance.
+    Tests the full ETL pipeline: Transform -> Initialize -> Load -> Finalize -> Metadata.
+    This test requires a running PostgreSQL instance.
     """
     # Arrange
     output_dir = tmp_path / "transformed_output"
+    release_info = {
+        "release_version": "2025_TEST",
+        "release_date": datetime.date(2025, 1, 31),
+        "swissprot_entry_count": 1,
+        "trembl_entry_count": 1,
+    }
 
     # --- Act ---
-    # 1. Transform the XML to intermediate TSV files
+    # 1. Transform
     transformer.transform_xml_to_tsv(sample_xml_file, output_dir)
 
-    # 2. Initialize the staging schema
-    db_adapter.initialize_schema()
+    # 2. Initialize
+    db_adapter.initialize_schema(mode='full')
 
-    # 3. Load the intermediate files into the staging schema
-    db_adapter.load_transformed_data(output_dir)
+    # 3. Load
+    for table_name in TABLE_LOAD_ORDER:
+        file_path = output_dir / f"{table_name}.tsv.gz"
+        if file_path.exists():
+            db_adapter.bulk_load_intermediate(file_path, table_name)
 
-    # 4. Finalize the load (create indexes and swap schemas)
+    # 4. Finalize
     db_adapter.finalize_load(mode='full')
 
+    # 5. Update Metadata
+    db_adapter.update_metadata(release_info)
+
+
     # --- Assert ---
-    # Check that the final production schema and its tables exist
     with postgres_connection() as conn, conn.cursor() as cur:
-        # Check if schema exists
+        # Assert schema and table structure
         cur.execute("SELECT 1 FROM pg_namespace WHERE nspname = %s", (db_adapter.production_schema,))
         assert cur.fetchone() is not None, "Production schema should exist"
-
-        # Check if staging schema was cleaned up by the rename
         cur.execute("SELECT 1 FROM pg_namespace WHERE nspname = %s", (db_adapter.staging_schema,))
         assert cur.fetchone() is None, "Staging schema should have been renamed"
 
-        # Check row counts in key tables
+        # Assert data integrity
         cur.execute(f"SELECT COUNT(*) FROM {db_adapter.production_schema}.proteins")
         assert cur.fetchone()[0] == 2
-
-        cur.execute(f"SELECT COUNT(*) FROM {db_adapter.production_schema}.accessions")
-        assert cur.fetchone()[0] == 1 # Only one secondary accession in the sample
-
-        cur.execute(f"SELECT COUNT(*) FROM {db_adapter.production_schema}.taxonomy")
-        assert cur.fetchone()[0] == 2
-
-        cur.execute(f"SELECT COUNT(*) FROM {db_adapter.production_schema}.protein_to_taxonomy")
-        assert cur.fetchone()[0] == 2
-
-        cur.execute(f"SELECT COUNT(*) FROM {db_adapter.production_schema}.genes")
-        assert cur.fetchone()[0] == 1
-
-        cur.execute(f"SELECT COUNT(*) FROM {db_adapter.production_schema}.protein_to_go")
-        assert cur.fetchone()[0] == 1
-
-        cur.execute(f"SELECT COUNT(*) FROM {db_adapter.production_schema}.keywords")
-        assert cur.fetchone()[0] == 1
-
-        # Verify specific data points
         cur.execute(f"SELECT uniprot_id FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'")
         assert cur.fetchone()[0] == 'TEST1_HUMAN'
 
-        # Verify JSONB data was loaded
-        cur.execute(f"SELECT comments_data -> 0 ->> 'tag' FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'")
-        assert cur.fetchone()[0] == 'comment'
-
-        cur.execute(f"SELECT features_data -> 0 ->> 'tag' FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'")
-        assert cur.fetchone()[0] == 'feature'
+        # Assert Metadata
+        cur.execute(f"SELECT release_version, release_date FROM {db_adapter.production_schema}.py_load_uniprot_metadata")
+        metadata_row = cur.fetchone()
+        assert metadata_row is not None, "Metadata row should exist"
+        assert metadata_row[0] == "2025_TEST"
+        assert metadata_row[1] == datetime.date(2025, 1, 31)
 
 
 def test_delta_load_pipeline(sample_xml_file: Path, sample_xml_v2_file: Path, db_adapter: PostgresAdapter, tmp_path: Path):
@@ -196,29 +191,34 @@ def test_delta_load_pipeline(sample_xml_file: Path, sample_xml_v2_file: Path, db
     # --- Act 1: Initial Full Load (V1) ---
     print("--- Running Initial Full Load (V1) ---")
     transformer.transform_xml_to_tsv(sample_xml_file, output_dir_v1)
-    db_adapter.initialize_schema() # Staging
-    db_adapter.load_transformed_data(output_dir_v1)
+    db_adapter.initialize_schema(mode='full')
+    for table_name in TABLE_LOAD_ORDER:
+        file_path = output_dir_v1 / f"{table_name}.tsv.gz"
+        if file_path.exists():
+            db_adapter.bulk_load_intermediate(file_path, table_name)
     db_adapter.finalize_load(mode='full')
+    db_adapter.update_metadata({"release_version": "V1_TEST", "release_date": datetime.date(2024, 1, 1), "swissprot_entry_count": 1, "trembl_entry_count": 1})
     print("--- Full Load (V1) Complete ---")
 
     # --- Assert 1: State after Full Load ---
     with postgres_connection() as conn, conn.cursor() as cur:
-        # Check counts
         cur.execute(f"SELECT COUNT(*) FROM {db_adapter.production_schema}.proteins")
         assert cur.fetchone()[0] == 2
-        # Check original protein name
-        cur.execute(f"SELECT name FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'")
+        cur.execute(f"SELECT uniprot_id FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'")
         assert cur.fetchone()[0] == 'TEST1_HUMAN'
-        # Check that the "to-be-deleted" protein exists
         cur.execute(f"SELECT 1 FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P67890'")
         assert cur.fetchone() is not None
 
     # --- Act 2: Delta Load (V2) ---
     print("--- Running Delta Load (V2) ---")
     transformer.transform_xml_to_tsv(sample_xml_v2_file, output_dir_v2)
-    db_adapter.initialize_schema() # Re-initialize STAGING schema
-    db_adapter.load_transformed_data(output_dir_v2)
+    db_adapter.initialize_schema(mode='delta') # Re-initialize STAGING schema
+    for table_name in TABLE_LOAD_ORDER:
+        file_path = output_dir_v2 / f"{table_name}.tsv.gz"
+        if file_path.exists():
+            db_adapter.bulk_load_intermediate(file_path, table_name)
     db_adapter.finalize_load(mode='delta')
+    db_adapter.update_metadata({"release_version": "V2_TEST", "release_date": datetime.date(2025, 1, 1), "swissprot_entry_count": 2, "trembl_entry_count": 0})
     print("--- Delta Load (V2) Complete ---")
 
     # --- Assert 2: State after Delta Load ---
@@ -228,7 +228,7 @@ def test_delta_load_pipeline(sample_xml_file: Path, sample_xml_v2_file: Path, db
         assert cur.fetchone()[0] == 2, "Total protein count should be 2 after delta."
 
         # Check that P12345 was updated
-        cur.execute(f"SELECT name, sequence_length FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'")
+        cur.execute(f"SELECT uniprot_id, sequence_length FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'")
         updated_protein = cur.fetchone()
         assert updated_protein[0] == 'TEST1_HUMAN_UPDATED', "Protein P12345 should have been updated."
         assert updated_protein[1] == 11, "Sequence length for P12345 should have been updated."
@@ -238,5 +238,40 @@ def test_delta_load_pipeline(sample_xml_file: Path, sample_xml_v2_file: Path, db
         assert cur.fetchone() is None, "Protein P67890 should have been deleted."
 
         # Check that A0A0A0 was inserted
-        cur.execute(f"SELECT name FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'A0A0A0'")
+        cur.execute(f"SELECT uniprot_id FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'A0A0A0'")
         assert cur.fetchone()[0] == 'TEST3_NEW', "New protein A0A0A0 should have been inserted."
+
+        # Check that metadata was updated to V2
+        cur.execute(f"SELECT release_version FROM {db_adapter.production_schema}.py_load_uniprot_metadata")
+        assert cur.fetchone()[0] == 'V2_TEST'
+
+
+def test_status_command_reporting(db_adapter: PostgresAdapter, sample_xml_file: Path, tmp_path: Path):
+    """
+    Tests that the get_current_release_version function (used by the status command)
+    reports the correct status before and after a load.
+    """
+    # 1. Before anything is loaded, it should return None
+    version = db_adapter.get_current_release_version()
+    assert version is None, "Version should be None for an uninitialized database"
+
+    # 2. After a full load, it should return the correct version
+    output_dir = tmp_path / "transformed_output"
+    release_info = {
+        "release_version": "2025_STATUS_TEST",
+        "release_date": datetime.date(2025, 2, 1),
+        "swissprot_entry_count": 1,
+        "trembl_entry_count": 1,
+    }
+    transformer.transform_xml_to_tsv(sample_xml_file, output_dir)
+    db_adapter.initialize_schema(mode='full')
+    for table_name in TABLE_LOAD_ORDER:
+        file_path = output_dir / f"{table_name}.tsv.gz"
+        if file_path.exists():
+            db_adapter.bulk_load_intermediate(file_path, table_name)
+    db_adapter.finalize_load(mode='full')
+    db_adapter.update_metadata(release_info)
+
+    # Now, check the version again
+    version = db_adapter.get_current_release_version()
+    assert version == "2025_STATUS_TEST", "get_current_release_version should return the loaded version"

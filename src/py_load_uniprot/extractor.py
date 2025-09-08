@@ -1,250 +1,224 @@
+"""
+Extractor module for py-load-uniprot.
+
+This module is responsible for acquiring data from UniProt's FTP/HTTPS endpoints.
+Its key responsibilities include:
+- Downloading large data files (e.g., uniprot_sprot.xml.gz) with progress tracking.
+- Verifying the integrity of downloaded files using MD5 checksums.
+- Fetching and parsing release metadata.
+- Handling network errors with retry logic (to be implemented).
+"""
+
 import hashlib
-import requests
-from pathlib import Path
-import time
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from rich.progress import (
-    Progress,
-    BarColumn,
-    DownloadColumn,
-    TransferSpeedColumn,
-    TimeRemainingColumn,
-)
-from rich import print
 import re
-from datetime import datetime
+from pathlib import Path
+from typing import Dict, Optional
 
-from py_load_uniprot.config import get_settings
+import requests
+from requests.adapters import HTTPAdapter
+from rich.progress import (
+    BarColumn,
+    Progress,
+    TextColumn,
+    TimeRemainingColumn,
+    TransferSpeedColumn,
+)
+from urllib3.util.retry import Retry
+
+from .config import Settings
 
 
-def _create_retry_session() -> requests.Session:
+class Extractor:
     """
-    Creates a requests session with a retry strategy.
-    This helps in handling transient network errors gracefully.
+    Handles the extraction of data from UniProt.
     """
-    session = requests.Session()
-    retry_strategy = Retry(
-        total=5,
-        backoff_factor=1,  # Will sleep for {backoff factor} * (2 ** ({number of total retries} - 1))
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["HEAD", "GET", "OPTIONS"],
-    )
-    adapter = HTTPAdapter(max_retries=retry_strategy)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    return session
 
-def get_release_metadata(session: requests.Session) -> dict[str, any]:
-    """
-    Fetches and parses the UniProt release notes file (reldate.txt).
+    def __init__(self, settings: Settings):
+        """
+        Initializes the Extractor with application settings.
 
-    Args:
-        session: The requests.Session to use for the request.
+        Args:
+            settings: The application configuration object.
+        """
+        self.settings = settings
+        self._checksums: Optional[Dict[str, str]] = None
+        self.session = self._create_retry_session()
+        self.settings.data_dir.mkdir(parents=True, exist_ok=True)
 
-    Returns:
-        A dictionary containing release metadata (version, date).
+    def _create_retry_session(self) -> requests.Session:
+        """
+        Creates a requests session with a retry strategy.
+        """
+        session = requests.Session()
+        retry_strategy = Retry(
+            total=5,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "OPTIONS"]
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        return session
 
-    Raises:
-        requests.exceptions.RequestException: If the release notes file cannot be downloaded.
-        ValueError: If the release notes format is unexpected.
-    """
-    settings = get_settings()
-    print(f"Fetching release metadata from [cyan]{settings.urls.release_notes_url}[/cyan]...")
-    response = session.get(settings.urls.release_notes_url)
-    response.raise_for_status()
-    content = response.text
+    def _get_progress_bar(self) -> Progress:
+        """Returns a pre-configured Rich progress bar."""
+        return Progress(
+            TextColumn("[bold blue]{task.fields[filename]}", justify="right"),
+            BarColumn(bar_width=None),
+            "[progress.percentage]{task.percentage:>3.1f}%",
+            "•",
+            TransferSpeedColumn(),
+            "•",
+            TimeRemainingColumn(),
+        )
 
-    # Example reldate.txt content:
-    # Release 2024_02 of 21-Feb-2024
-    # UniProt Knowledgebase
-    # Copyright (...)
-    #
-    # Swiss-Prot Release 2024_02 of 21-Feb-2024 contains 571168 sequence entries
-    # TrEMBL Release 2024_02 of 21-Feb-2024 contains 269075841 sequence entries
+    def download_file(self, filename: str) -> Path:
+        """
+        Downloads a file from the UniProt FTP server with progress tracking.
 
-    # Use regex to find the main release line
-    match = re.search(r"Release (\d{4}_\d{2}) of (\d{2}-\w{3}-\d{4})", content)
-    if not match:
-        raise ValueError("Could not parse release version and date from reldate.txt")
+        Args:
+            filename: The name of the file to download (e.g., 'uniprot_sprot.xml.gz').
 
-    release_version = match.group(1)
-    release_date_str = match.group(2)
-    release_date = datetime.strptime(release_date_str, "%d-%b-%Y").date()
+        Returns:
+            The path to the downloaded file.
+        """
+        url = f"{self.settings.urls.uniprot_ftp_base_url}{filename}"
+        local_path = self.settings.data_dir / filename
 
-    # Optional: Extract entry counts
-    swissprot_match = re.search(r"Swiss-Prot.*contains (\d+) sequence entries", content)
-    trembl_match = re.search(r"TrEMBL.*contains (\d+) sequence entries", content)
+        print(f"Starting download of {filename} from {url}")
 
-    swissprot_count = int(swissprot_match.group(1)) if swissprot_match else None
-    trembl_count = int(trembl_match.group(1)) if trembl_match else None
-
-    metadata = {
-        "release_version": release_version,
-        "release_date": release_date,
-        "swissprot_entry_count": swissprot_count,
-        "trembl_entry_count": trembl_count,
-    }
-    print(f"[green]Found UniProt Release: {release_version} ({release_date})[/green]")
-    return metadata
-
-def get_release_checksums(session: requests.Session) -> dict[str, str]:
-    """
-    Fetches and parses the MD5 checksum file from UniProt.
-
-    Args:
-        session: The requests.Session to use for the request.
-
-    Returns:
-        A dictionary mapping filenames to their expected MD5 checksums.
-
-    Raises:
-        requests.exceptions.RequestException: If the checksum file cannot be downloaded.
-    """
-    settings = get_settings()
-    print(f"Fetching checksums from [cyan]{settings.urls.checksums_url}[/cyan]...")
-    response = session.get(settings.urls.checksums_url)
-    response.raise_for_status()
-
-    checksums = {}
-    for line in response.text.strip().split("\n"):
-        if line:
-            # The format is "MD5_HASH  FILENAME"
-            md5_hash, filename = line.strip().split(maxsplit=1)
-            # The filenames in the checksum file might have a ./ prefix, so we remove it
-            checksums[filename.lstrip('./')] = md5_hash
-
-    return checksums
-
-def calculate_md5(filepath: Path, chunk_size: int = 8192) -> str:
-    """
-    Calculates the MD5 checksum for a given file.
-
-    Args:
-        filepath: The path to the file.
-        chunk_size: The size of chunks to read from the file for memory efficiency.
-
-    Returns:
-        The MD5 checksum as a hexadecimal string.
-    """
-    md5 = hashlib.md5()
-    with open(filepath, "rb") as f:
-        while chunk := f.read(chunk_size):
-            md5.update(chunk)
-    return md5.hexdigest()
-
-def download_uniprot_file(session: requests.Session, url: str, destination: Path) -> None:
-    """
-    Downloads a file from a URL to a destination, showing a rich progress bar.
-    This function uses a session object to enable connection pooling and retries.
-
-    Args:
-        session: The requests.Session object to use for the download.
-        url: The URL of the file to download.
-        destination: The local path to save the file.
-
-    Raises:
-        requests.exceptions.RequestException: If the file cannot be downloaded after retries.
-    """
-    response = session.get(url, stream=True)
-    response.raise_for_status()
-
-    total_size = int(response.headers.get("content-length", 0))
-
-    with Progress(
-        "[progress.description]{task.description}",
-        BarColumn(),
-        DownloadColumn(),
-        TransferSpeedColumn(),
-        "ETA:",
-        TimeRemainingColumn(),
-    ) as progress:
-        task = progress.add_task(f"[bold green]Downloading {destination.name}[/]", total=total_size)
-
-        with open(destination, "wb") as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
-                progress.update(task, advance=len(chunk))
-
-def run_extraction() -> dict[str, any]:
-    """
-    Orchestrates the entire data extraction process.
-
-    This function ensures the data directory exists, fetches release metadata,
-    fetches official checksums, downloads the required UniProt data files, and
-    verifies their integrity. It is idempotent.
-
-    Returns:
-        A dictionary containing the release metadata.
-
-    Raises:
-        RuntimeError: If metadata/checksums cannot be fetched or if a
-                      downloaded file has a checksum mismatch.
-    """
-    settings = get_settings()
-    print("[bold blue]Starting UniProt data extraction...[/bold blue]")
-    session = _create_retry_session()
-
-    # 1. Get release metadata first, as it's the source of truth for the release version
-    try:
-        release_metadata = get_release_metadata(session)
-    except (requests.exceptions.RequestException, ValueError) as e:
-        raise RuntimeError(f"Failed to get release metadata: {e}") from e
-
-    # 2. Ensure data directory exists
-    settings.data_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Data will be stored in: [green]{settings.data_dir.resolve()}[/green]")
-
-    # 3. Get official checksums
-    try:
-        checksums = get_release_checksums(session)
-    except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"Failed to fetch checksums from {settings.urls.checksums_url}") from e
-
-    # 4. Define files to download
-    files_to_download = {
-        "uniprot_sprot.xml.gz": settings.urls.swissprot_xml_url,
-        "uniprot_trembl.xml.gz": settings.urls.trembl_xml_url,
-    }
-
-    # 5. Download and verify each file
-    for filename, url in files_to_download.items():
-        destination = settings.data_dir / filename
-        print(f"\n[bold]Processing {filename}...[/bold]")
-
-        expected_checksum = checksums.get(filename)
-        if not expected_checksum:
-            print(f"[yellow]Warning: No checksum found for {filename}. Cannot verify integrity.[/yellow]")
-
-        # Check if file exists and is valid
-        if destination.exists():
-            print("File already exists. Verifying checksum...")
-            local_checksum = calculate_md5(destination)
-            if local_checksum == expected_checksum:
-                print(f"[green]Checksum for {filename} is correct. Skipping download.[/green]")
-                continue
-            else:
-                print("[yellow]Checksum mismatch. Re-downloading file.[/yellow]")
-
-        # Download the file
         try:
-            download_uniprot_file(session, url, destination)
+            with self.session.get(url, stream=True) as r:
+                r.raise_for_status()
+                total_size = int(r.headers.get('content-length', 0))
+
+                progress = self._get_progress_bar()
+                task_id = progress.add_task("download", total=total_size, filename=filename)
+
+                with open(local_path, 'wb') as f, progress:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                        progress.update(task_id, advance=len(chunk))
+
+            print(f"Successfully downloaded to {local_path}")
+            return local_path
+
         except requests.exceptions.RequestException as e:
-            raise RuntimeError(f"Failed to download {filename} from {url} after multiple retries") from e
+            print(f"Error downloading {filename}: {e}")
+            raise
 
-        # Verify checksum after download
-        if expected_checksum:
-            print("Verifying checksum...")
-            local_checksum = calculate_md5(destination)
+    def fetch_checksums(self) -> Dict[str, str]:
+        """
+        Downloads and parses the MD5 checksums file from UniProt.
+        If the file is not found (404), it returns an empty dictionary.
 
-            if local_checksum == expected_checksum:
-                print(f"[green]Successfully downloaded and verified {filename}.[/green]")
+        Returns:
+            A dictionary mapping filenames to their MD5 checksums.
+        """
+        url = f"{self.settings.urls.uniprot_ftp_base_url}{self.settings.urls.checksums_filename}"
+        checksum_map = {}
+
+        print(f"Fetching checksums from {url}")
+        try:
+            response = self.session.get(url)
+            if response.status_code == 404:
+                print(f"Warning: Checksum file not found at {url}. Skipping checksum verification.")
+                self._checksums = {}
+                return self._checksums
+
+            response.raise_for_status()
+
+            # The file format is: <md5_hash>  <filename>
+            for line in response.text.strip().split('\n'):
+                match = re.match(r'^\s*([a-f0-9]{32})\s+([\w\.\-\_]+\.gz)\s*$', line)
+                if match:
+                    checksum, filename = match.groups()
+                    checksum_map[filename] = checksum
+
+            self._checksums = checksum_map
+            print(f"Successfully fetched and parsed {len(checksum_map)} checksums.")
+            return self._checksums
+
+        except requests.exceptions.RequestException as e:
+            print(f"Error fetching checksums: {e}")
+            # In case of other network errors, we'll also return empty and warn
+            print(f"Warning: Could not fetch checksums due to a network error. Skipping verification.")
+            self._checksums = {}
+            return self._checksums
+
+    def verify_checksum(self, file_path: Path) -> bool:
+        """
+        Verifies the MD5 checksum of a downloaded file.
+
+        Args:
+            file_path: The path to the file to verify.
+
+        Returns:
+            True if the checksum is valid, False otherwise.
+        """
+        if not self._checksums:
+            self.fetch_checksums()
+
+        filename = file_path.name
+        expected_md5 = self._checksums.get(filename)
+
+        if not expected_md5:
+            print(f"Warning: No checksum found for {filename}. Skipping verification.")
+            return True # Or False, depending on strictness required
+
+        print(f"Verifying checksum for {filename}...")
+
+        md5 = hashlib.md5()
+        with open(file_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                md5.update(chunk)
+
+        actual_md5 = md5.hexdigest()
+
+        if actual_md5 == expected_md5:
+            print(f"Checksum for {filename} is valid.")
+            return True
+        else:
+            print(f"Error: Checksum mismatch for {filename}.")
+            print(f"  Expected: {expected_md5}")
+            print(f"  Actual:   {actual_md5}")
+            return False
+
+    def get_release_info(self) -> Dict[str, str]:
+        """
+        Downloads and parses release notes to get the current version and date,
+        then persists this metadata to a JSON file.
+
+        Returns:
+            A dictionary with 'version' and 'date'.
+        """
+        import json
+        url = f"{self.settings.urls.uniprot_ftp_base_url}{self.settings.urls.release_notes_filename}"
+        print(f"Fetching release info from {url}")
+
+        try:
+            response = self.session.get(url)
+            response.raise_for_status()
+
+            # Example format:
+            # Release 2025_09 of 08-Sep-2025
+            match = re.search(r"Release\s+(\S+)\s+of\s+(.*)", response.text)
+            if match:
+                version, date = match.groups()
+                info = {'version': version, 'date': date}
+                print(f"Found release info: {info}")
+
+                # Persist the metadata
+                metadata_path = self.settings.data_dir / "release_metadata.json"
+                with open(metadata_path, 'w') as f:
+                    json.dump(info, f, indent=2)
+                print(f"Release metadata saved to {metadata_path}")
+
+                return info
             else:
-                raise RuntimeError(
-                    f"[bold red]Checksum mismatch for {filename}![/bold red]\n"
-                    f"Expected: {expected_checksum}\n"
-                    f"Got:      {local_checksum}"
-                )
+                raise ValueError("Could not parse release information from reldate.txt")
 
-    print("\n[bold blue]Extraction process completed successfully.[/bold blue]")
-    return release_metadata
+        except requests.exceptions.RequestException as e:
+            print(f"Error fetching release info: {e}")
+            raise

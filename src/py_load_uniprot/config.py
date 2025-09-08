@@ -1,110 +1,121 @@
+"""
+Configuration management for py-load-uniprot.
+
+This module uses pydantic-settings to load configuration from a YAML file
+and/or environment variables. It ensures that all necessary configuration
+parameters are present and correctly typed.
+
+The order of precedence for loading settings is:
+1. Environment variables (highest priority)
+2. YAML file
+3. Default values defined in the models
+
+Environment variables must be prefixed with 'PY_LOAD_UNIPROT_'.
+Nested keys are separated by double underscores, e.g., PY_LOAD_UNIPROT_DB__HOST.
+"""
+
+from pathlib import Path
+from typing import Any, Dict, Optional
+
 import yaml
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pathlib import Path
-from typing import Optional
 
-# This will be the global settings object, initialized by the CLI.
-# This approach prevents the settings from being loaded at import time,
-# allowing the CLI to control the configuration source.
-_settings_instance: Optional["Settings"] = None
+# --- Pydantic Models ---
 
-class DatabaseSettings(BaseModel):
-    """Pydantic model for database connection settings."""
+class DBSettings(BaseModel):
+    """Database connection settings."""
     host: str = "localhost"
     port: int = 5432
-    user: str = "user"
+    user: str = "postgres"
     password: str = "password"
     dbname: str = "uniprot"
 
-class UrlsSettings(BaseModel):
-    """Pydantic model for UniProt URLs."""
+
+class URLSettings(BaseModel):
+    """UniProt source URL settings."""
     uniprot_ftp_base_url: str = "https://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/complete/"
     release_notes_filename: str = "reldate.txt"
-    checksums_filename: str = "md5"
+    checksums_filename: str = "MD5SUMS"
 
-    @property
-    def swissprot_xml_url(self) -> str:
-        return f"{self.uniprot_ftp_base_url}uniprot_sprot.xml.gz"
 
-    @property
-    def trembl_xml_url(self) -> str:
-        return f"{self.uniprot_ftp_base_url}uniprot_trembl.xml.gz"
-
-    @property
-    def release_notes_url(self) -> str:
-        return f"{self.uniprot_ftp_base_url}{self.release_notes_filename}"
-
-    @property
-    def checksums_url(self) -> str:
-        return f"{self.uniprot_ftp_base_url}{self.checksums_filename}"
+def yaml_config_settings_source(settings: BaseSettings) -> Dict[str, Any]:
+    """
+    A custom settings source that loads configuration from a YAML file.
+    The path to the YAML file is specified in the `config_file` attribute
+    of the main Settings class.
+    """
+    config_file = getattr(settings.__class__.model_config, 'config_file', None)
+    if config_file and Path(config_file).is_file():
+        with open(config_file, 'r') as f:
+            return yaml.safe_load(f)
+    return {}
 
 
 class Settings(BaseSettings):
     """
-    Manages the configuration for the py-load-uniprot package.
-    Settings can be loaded from a YAML file, environment variables, or a .env file.
-    Environment variables will override values from a YAML file.
+    Main configuration class for the application.
     """
+    data_dir: Path = Field(default="data", description="Directory to store downloaded UniProt files.")
+    db: DBSettings = Field(default_factory=DBSettings)
+    urls: URLSettings = Field(default_factory=URLSettings)
+
     model_config = SettingsConfigDict(
-        env_file='.env',
-        env_file_encoding='utf-8',
-        extra='ignore',
-        env_nested_delimiter='__' # e.g., PY_LOAD_UNIPROT_DB__HOST
+        env_prefix='PY_LOAD_UNIPROT_',
+        env_nested_delimiter='__',
+        config_file=None
     )
 
-    data_dir: Path = Path("data")
-    db: DatabaseSettings = Field(default_factory=DatabaseSettings)
-    urls: UrlsSettings = Field(default_factory=UrlsSettings)
-
-    @property
-    def db_connection_string(self) -> str:
-        """Constructs the database connection string from the 'db' model."""
-        return (
-            f"dbname='{self.db.dbname}' "
-            f"user='{self.db.user}' "
-            f"host='{self.db.host}' "
-            f"password='{self.db.password}' "
-            f"port='{self.db.port}'"
-        )
-
     @classmethod
-    def from_yaml(cls, path: Path) -> "Settings":
+    def from_yaml(cls, path: Optional[Path]) -> "Settings":
         """
-        Loads configuration from a YAML file and merges it with environment variables.
+        Factory method to create a Settings instance from a specific YAML file.
         """
-        if not path.exists():
-            raise FileNotFoundError(f"Configuration file not found at: {path}")
+        if path:
+            # Create a temporary config dict to pass the file path
+            config = SettingsConfigDict(config_file=str(path))
+            return cls(_settings_source=yaml_config_settings_source, **config)
+        return cls()
 
-        with open(path, 'r') as f:
-            yaml_data = yaml.safe_load(f) or {}
 
-        # Pydantic-settings will automatically load from env vars and .env file,
-        # and values from env vars will override those from the initial dict.
-        return cls(**yaml_data)
+# --- Singleton Pattern for Settings ---
+
+_settings: Optional[Settings] = None
+
+
+def initialize_settings(config_file: Optional[Path] = None):
+    """
+    Initializes the global settings object from a YAML file.
+    This function should be called once at application startup.
+    """
+    global _settings
+    if _settings is None:
+        if config_file and not config_file.exists():
+            raise FileNotFoundError(f"Configuration file not found: {config_file}")
+        _settings = Settings.from_yaml(config_file)
+    else:
+        # Optionally, you could log a warning that settings are already initialized.
+        pass
+
 
 def get_settings() -> Settings:
     """
-    Retrieves the global settings instance.
-    This function ensures that the settings have been initialized before use.
-    """
-    if _settings_instance is None:
-        raise RuntimeError(
-            "Settings have not been initialized. "
-            "Please call initialize_settings() from the CLI entrypoint."
-        )
-    return _settings_instance
+    Retrieves the global settings object.
 
-def initialize_settings(config_file: Optional[Path] = None) -> Settings:
+    Raises:
+        RuntimeError: If settings have not been initialized.
+
+    Returns:
+        The global Settings instance.
     """
-    Initializes the global settings from a YAML file or environment variables.
-    This should be called once at the start of the application from the CLI.
-    """
-    global _settings_instance
-    if config_file:
-        print(f"Loading configuration from: {config_file.resolve()}")
-        _settings_instance = Settings.from_yaml(config_file)
-    else:
-        print("Loading configuration from environment variables.")
-        _settings_instance = Settings()
-    return _settings_instance
+    if _settings is None:
+        # Initialize with defaults if not explicitly initialized.
+        # This is helpful for testing or simple script usage.
+        initialize_settings()
+
+    # The check below is now technically redundant due to the line above,
+    # but it's good for type-hinting and ensuring correctness.
+    if _settings is None:
+         raise RuntimeError("Settings have not been initialized. Call initialize_settings() first.")
+
+    return _settings

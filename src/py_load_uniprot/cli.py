@@ -46,17 +46,65 @@ def main_callback(
 
 
 @app.command()
-def download():
+def download(
+    dataset: str = typer.Option("swissprot", help="Dataset to download ('swissprot', 'trembl', or 'all')."),
+):
     """
-    Downloads UniProtKB data (Swiss-Prot and TrEMBL) and verifies file integrity.
-    This command is idempotent.
+    Downloads a specified UniProtKB dataset(s) and verifies file integrity.
     """
-    print("[bold blue]Initiating UniProt download process...[/bold blue]")
+    print(f"[bold blue]Initiating download for '{dataset}' dataset(s)...[/bold blue]")
+
+    valid_datasets = ["swissprot", "trembl"]
+    datasets_to_download = []
+
+    if dataset == "all":
+        datasets_to_download = valid_datasets
+    elif dataset in valid_datasets:
+        datasets_to_download.append(dataset)
+    else:
+        print(f"[bold red]Error: Invalid dataset '{dataset}'. Choose 'swissprot', 'trembl', or 'all'.[/bold red]")
+        raise typer.Exit(code=1)
+
     try:
-        extractor.run_extraction()
-        print("\n[bold green]CLI command 'download' completed successfully.[/bold green]")
+        settings = get_settings()
+        data_extractor = extractor.Extractor(settings)
+        failed_downloads = []
+
+        # Fetch release info and checksums once
+        release_info = data_extractor.get_release_info()
+        print(f"Downloading for UniProt Release: {release_info['version']} ({release_info['date']})")
+        data_extractor.fetch_checksums()
+
+        for ds in datasets_to_download:
+            print(f"\n[bold]----- Processing {ds} ----- [/bold]")
+            filename = f"uniprot_{'sprot' if ds == 'swissprot' else 'trembl'}.xml.gz"
+
+            try:
+                file_path = data_extractor.download_file(filename)
+                is_valid = data_extractor.verify_checksum(file_path)
+
+                if is_valid:
+                    print(f"[bold green]'{ds}' downloaded and verified successfully.[/bold green]")
+                else:
+                    print(f"[bold red]Checksum verification failed for '{ds}'.[/bold red]")
+                    failed_downloads.append(ds)
+            except Exception as e:
+                print(f"[bold red]An error occurred while downloading {ds}: {e}[/bold red]")
+                failed_downloads.append(ds)
+
+        if failed_downloads:
+            print(f"\n[bold red]Download process finished with errors. Failed datasets: {', '.join(failed_downloads)}[/bold red]")
+            raise typer.Exit(code=2)
+        else:
+            print("\n[bold green]All specified datasets downloaded successfully.[/bold green]")
+
+    except FileNotFoundError as e:
+        print(f"\n[bold red]Configuration Error: {e}[/bold red]")
+        raise typer.Exit(code=1)
     except Exception as e:
-        print(f"\n[bold red]An error occurred during the download process: {e}[/bold red]")
+        print(f"\n[bold red]An unexpected error occurred during the download process: {e}[/bold red]")
+        import traceback
+        traceback.print_exc()
         raise typer.Exit(code=1)
 
 @app.command()

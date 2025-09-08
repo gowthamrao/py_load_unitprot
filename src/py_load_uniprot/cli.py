@@ -31,7 +31,7 @@ def download():
 @app.command()
 def run(
     dataset: str = typer.Option("swissprot", help="Dataset to load ('swissprot' or 'trembl')."),
-    mode: str = typer.Option("full", help="Load mode ('full' or 'delta'). Delta not implemented yet."),
+    mode: str = typer.Option("full", help="Load mode ('full' or 'delta')."),
 ):
     """
     Run the full ETL pipeline for a specified dataset and load mode.
@@ -39,8 +39,8 @@ def run(
     print(f"[bold blue]Starting ETL pipeline run...[/bold blue]")
     print(f"Dataset: [cyan]{dataset}[/cyan], Mode: [cyan]{mode}[/cyan]")
 
-    if mode != 'full':
-        print(f"[bold red]Error: Load mode '{mode}' is not yet implemented.[/bold red]")
+    if mode not in ['full', 'delta']:
+        print(f"[bold red]Error: Load mode '{mode}' is not valid. Choose 'full' or 'delta'.[/bold red]")
         raise typer.Exit(code=1)
 
     if dataset not in ['swissprot', 'trembl']:

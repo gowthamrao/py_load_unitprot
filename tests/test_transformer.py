@@ -129,3 +129,73 @@ def test_transform_xml_to_tsv_creates_correct_output(sample_xml_file: Path, tmp_
         transformer.TABLE_HEADERS["keywords"],
         ["P12345", "KW-0181", "Complete proteome"]
     ]
+
+# --- Test for parallel implementation ---
+
+def transform_xml_to_tsv_single_threaded(xml_file: Path, output_dir: Path):
+    """
+    A single-threaded version of the transformer, kept for baseline comparison.
+    """
+    from lxml import etree
+
+    # This is a recreation of the original single-threaded implementation
+    with gzip.open(xml_file, "rb") as f_in, transformer.FileWriterManager(output_dir) as writers:
+        context = etree.iterparse(f_in, events=("end",), tag=transformer._get_tag("entry"))
+        seen_taxonomy_ids = set()
+
+        for _, elem in context:
+            parsed_data = transformer._parse_entry(elem)
+
+            for table_name, rows in parsed_data.items():
+                if table_name == "taxonomy":
+                    unique_rows = []
+                    for row in rows:
+                        tax_id = row[0]
+                        if tax_id not in seen_taxonomy_ids:
+                            unique_rows.append(row)
+                            seen_taxonomy_ids.add(tax_id)
+                    if unique_rows:
+                        writers[table_name].writerows(unique_rows)
+                else:
+                    writers[table_name].writerows(rows)
+            # Crucial memory management
+            elem.clear()
+            while elem.getprevious() is not None:
+                del elem.getparent()[0]
+
+def test_parallel_transformer_matches_single_threaded(sample_xml_file: Path, tmp_path: Path):
+    """
+    Verifies that the parallel transformer produces the exact same output as
+    the original single-threaded implementation.
+    """
+    # Arrange
+    output_single = tmp_path / "output_single"
+    output_parallel = tmp_path / "output_parallel"
+    output_single.mkdir()
+    output_parallel.mkdir()
+
+    # Act
+    # Run single-threaded version
+    transform_xml_to_tsv_single_threaded(sample_xml_file, output_single)
+    # Run parallel version
+    transformer.transform_xml_to_tsv(sample_xml_file, output_parallel, num_workers=2)
+
+    # Assert
+    # Check that the same files were created
+    single_files = sorted([p.name for p in output_single.glob("*.tsv.gz")])
+    parallel_files = sorted([p.name for p in output_parallel.glob("*.tsv.gz")])
+    assert single_files == parallel_files, "The set of created files should be identical"
+    assert len(single_files) > 0, "At least one file should have been created"
+
+    # Check the content of each file
+    for filename in single_files:
+        single_content = read_tsv_gz(output_single / filename)
+        parallel_content = read_tsv_gz(output_parallel / filename)
+
+        # Sort content to account for non-deterministic order of processing
+        # Header should be the same, so we sort data rows
+        single_header, single_data = single_content[0], sorted(single_content[1:])
+        parallel_header, parallel_data = parallel_content[0], sorted(parallel_content[1:])
+
+        assert single_header == parallel_header, f"Headers in {filename} should match"
+        assert single_data == parallel_data, f"Data in {filename} should match after sorting"

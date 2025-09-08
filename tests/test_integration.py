@@ -75,10 +75,53 @@ def db_adapter() -> PostgresAdapter:
         print(f"Error during teardown: {e}")
 
 
-@pytest.mark.skip(reason="Requires a running PostgreSQL instance for integration testing.")
+# V2: P12345 is modified, P67890 is deleted, A0A0A0 is new
+SAMPLE_XML_V2_CONTENT = """<?xml version="1.0" encoding="UTF-8"?>
+<uniprot xmlns="http://uniprot.org/uniprot">
+<entry dataset="Swiss-Prot" created="2000-05-30" modified="2025-01-01" version="151">
+  <accession>P12345</accession>
+  <accession>Q9Y5Y5</accession>
+  <name>TEST1_HUMAN_UPDATED</name>
+  <protein>
+    <recommendedName><fullName>Test protein 1 - Updated</fullName></recommendedName>
+  </protein>
+  <gene><name type="primary">TP1_UPDATED</name></gene>
+  <organism>
+    <name type="scientific">Homo sapiens</name>
+    <dbReference type="NCBI Taxonomy" id="9606"/>
+    <lineage><taxon>Eukaryota</taxon><taxon>Metazoa</taxon></lineage>
+  </organism>
+  <sequence length="11" mass="1112">MTESTSEQAAX</sequence>
+</entry>
+<entry dataset="Swiss-Prot" created="2025-01-01" modified="2025-01-01" version="1">
+  <accession>A0A0A0</accession>
+  <name>TEST3_NEW</name>
+  <protein>
+    <recommendedName><fullName>Test protein 3 - New</fullName></recommendedName>
+  </protein>
+  <organism>
+    <name type="scientific">Pan troglodytes</name>
+    <dbReference type="NCBI Taxonomy" id="9598"/>
+    <lineage><taxon>Eukaryota</taxon><taxon>Metazoa</taxon></lineage>
+  </organism>
+  <sequence length="5" mass="555">MNEWP</sequence>
+</entry>
+</uniprot>
+"""
+
+@pytest.fixture
+def sample_xml_v2_file(tmp_path: Path) -> Path:
+    """Creates a gzipped sample V2 XML file for delta load testing."""
+    xml_path = tmp_path / "sample_v2.xml.gz"
+    with gzip.open(xml_path, "wt", encoding="utf-8") as f:
+        f.write(SAMPLE_XML_V2_CONTENT)
+    return xml_path
+
+
 def test_full_etl_pipeline(sample_xml_file: Path, db_adapter: PostgresAdapter, tmp_path: Path):
     """
     Tests the full ETL pipeline: Transform -> Initialize -> Load -> Finalize.
+    This test is NOT skipped and requires a running PostgreSQL instance.
     """
     # Arrange
     output_dir = tmp_path / "transformed_output"
@@ -139,3 +182,61 @@ def test_full_etl_pipeline(sample_xml_file: Path, db_adapter: PostgresAdapter, t
 
         cur.execute(f"SELECT features_data -> 0 ->> 'tag' FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'")
         assert cur.fetchone()[0] == 'feature'
+
+
+def test_delta_load_pipeline(sample_xml_file: Path, sample_xml_v2_file: Path, db_adapter: PostgresAdapter, tmp_path: Path):
+    """
+    Tests the delta load functionality by performing a full load, then a delta load,
+    and verifying the state of the database after each step.
+    """
+    # Arrange
+    output_dir_v1 = tmp_path / "transformed_v1"
+    output_dir_v2 = tmp_path / "transformed_v2"
+
+    # --- Act 1: Initial Full Load (V1) ---
+    print("--- Running Initial Full Load (V1) ---")
+    transformer.transform_xml_to_tsv(sample_xml_file, output_dir_v1)
+    db_adapter.initialize_schema() # Staging
+    db_adapter.load_transformed_data(output_dir_v1)
+    db_adapter.finalize_load(mode='full')
+    print("--- Full Load (V1) Complete ---")
+
+    # --- Assert 1: State after Full Load ---
+    with postgres_connection() as conn, conn.cursor() as cur:
+        # Check counts
+        cur.execute(f"SELECT COUNT(*) FROM {db_adapter.production_schema}.proteins")
+        assert cur.fetchone()[0] == 2
+        # Check original protein name
+        cur.execute(f"SELECT name FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'")
+        assert cur.fetchone()[0] == 'TEST1_HUMAN'
+        # Check that the "to-be-deleted" protein exists
+        cur.execute(f"SELECT 1 FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P67890'")
+        assert cur.fetchone() is not None
+
+    # --- Act 2: Delta Load (V2) ---
+    print("--- Running Delta Load (V2) ---")
+    transformer.transform_xml_to_tsv(sample_xml_v2_file, output_dir_v2)
+    db_adapter.initialize_schema() # Re-initialize STAGING schema
+    db_adapter.load_transformed_data(output_dir_v2)
+    db_adapter.finalize_load(mode='delta')
+    print("--- Delta Load (V2) Complete ---")
+
+    # --- Assert 2: State after Delta Load ---
+    with postgres_connection() as conn, conn.cursor() as cur:
+        # Check total count: 2 (initial) - 1 (deleted) + 1 (new) = 2
+        cur.execute(f"SELECT COUNT(*) FROM {db_adapter.production_schema}.proteins")
+        assert cur.fetchone()[0] == 2, "Total protein count should be 2 after delta."
+
+        # Check that P12345 was updated
+        cur.execute(f"SELECT name, sequence_length FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'")
+        updated_protein = cur.fetchone()
+        assert updated_protein[0] == 'TEST1_HUMAN_UPDATED', "Protein P12345 should have been updated."
+        assert updated_protein[1] == 11, "Sequence length for P12345 should have been updated."
+
+        # Check that P67890 was deleted
+        cur.execute(f"SELECT 1 FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P67890'")
+        assert cur.fetchone() is None, "Protein P67890 should have been deleted."
+
+        # Check that A0A0A0 was inserted
+        cur.execute(f"SELECT name FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'A0A0A0'")
+        assert cur.fetchone()[0] == 'TEST3_NEW', "New protein A0A0A0 should have been inserted."

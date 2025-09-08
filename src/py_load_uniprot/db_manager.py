@@ -30,6 +30,16 @@ def postgres_connection():
 
 class DatabaseAdapter(ABC):
     @abstractmethod
+    def check_connection(self) -> None:
+        """Checks if a connection to the database can be established."""
+        pass
+
+    @abstractmethod
+    def create_production_schema(self) -> None:
+        """Creates the main production schema and tables if they don't exist."""
+        pass
+
+    @abstractmethod
     def initialize_schema(self, mode: str) -> None:
         """Prepares the database schema (e.g., main tables or staging schema)."""
         pass
@@ -59,6 +69,18 @@ class PostgresAdapter(DatabaseAdapter):
         self.staging_schema = staging_schema
         self.production_schema = production_schema
         print(f"PostgresAdapter initialized. Staging: [cyan]{self.staging_schema}[/cyan], Production: [cyan]{self.production_schema}[/cyan]")
+
+    def check_connection(self) -> None:
+        """Establishes a connection and performs a simple query."""
+        with postgres_connection() as conn, conn.cursor() as cur:
+            cur.execute("SELECT 1;")
+        print("[green]Database connection verified.[/green]")
+
+    def create_production_schema(self) -> None:
+        """Creates the production schema and tables if they don't exist."""
+        with postgres_connection() as conn, conn.cursor() as cur:
+            self._create_production_schema_if_not_exists(cur)
+            conn.commit()
 
     def _get_schema_ddl(self) -> str:
         # Same as before, but good to have it defined once

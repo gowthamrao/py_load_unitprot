@@ -87,17 +87,22 @@ def test_transform_xml_to_tsv_creates_correct_output(sample_xml_file: Path, tmp_
     # --- Assert proteins.tsv.gz ---
     proteins_rows = read_tsv_gz(output_dir / "proteins.tsv.gz")
     assert proteins_rows[0] == transformer.TABLE_HEADERS["proteins"]
-    assert len(proteins_rows) == 3 # Header + 2 entries
+    protein_data = sorted(proteins_rows[1:], key=lambda r: r[0]) # Sort by accession
+    assert len(protein_data) == 2
 
-    # Check first protein row
-    p1_row = proteins_rows[1]
+    # Check P12345
+    p1_row = protein_data[0]
     assert p1_row[0:6] == ["P12345", "TEST1_HUMAN", "10", "1111", "2000-05-30", "2024-07-17"]
-    # Check JSONB columns - should not be empty
     assert json.loads(p1_row[6])[0]['tag'] == 'comment'
     assert json.loads(p1_row[7])[0]['tag'] == 'feature'
-    assert p1_row[8] == '' # db_references_data is empty for this entry
+    assert p1_row[8] == ''
 
-    # --- Assert other tables ---
+    # Check P67890
+    p2_row = protein_data[1]
+    assert p2_row[0:6] == ["P67890", "TEST2_MOUSE", "12", "2222", "2010-10-12", "2024-07-18"]
+
+
+    # --- Assert other tables (with sorting where necessary) ---
     accessions_rows = read_tsv_gz(output_dir / "accessions.tsv.gz")
     assert accessions_rows == [
         transformer.TABLE_HEADERS["accessions"],
@@ -105,12 +110,16 @@ def test_transform_xml_to_tsv_creates_correct_output(sample_xml_file: Path, tmp_
     ]
 
     sequences_rows = read_tsv_gz(output_dir / "sequences.tsv.gz")
-    assert len(sequences_rows) == 3
-    assert sequences_rows[1] == ["P12345", "MTESTSEQAA"]
+    sequence_data = sorted(sequences_rows[1:], key=lambda r: r[0])
+    assert len(sequence_data) == 2
+    assert sequence_data[0] == ["P12345", "MTESTSEQAA"]
+    assert sequence_data[1] == ["P67890", "MTESTSEQBBBB"]
 
     taxonomy_rows = read_tsv_gz(output_dir / "taxonomy.tsv.gz")
-    assert len(taxonomy_rows) == 3
-    assert taxonomy_rows[1] == ["9606", "Homo sapiens", "Eukaryota > Metazoa"]
+    taxonomy_data = sorted(taxonomy_rows[1:], key=lambda r: r[0]) # Sort by taxid
+    assert len(taxonomy_data) == 2
+    assert taxonomy_data[0] == ["10090", "Mus musculus", "Eukaryota > Metazoa"]
+    assert taxonomy_data[1] == ["9606", "Homo sapiens", "Eukaryota > Metazoa"]
 
     genes_rows = read_tsv_gz(output_dir / "genes.tsv.gz")
     assert genes_rows == [

@@ -15,7 +15,7 @@ from rich import print
 import re
 from datetime import datetime
 
-from py_load_uniprot.config import settings
+from py_load_uniprot.config import get_settings
 
 
 def _create_retry_session() -> requests.Session:
@@ -49,8 +49,9 @@ def get_release_metadata(session: requests.Session) -> dict[str, any]:
         requests.exceptions.RequestException: If the release notes file cannot be downloaded.
         ValueError: If the release notes format is unexpected.
     """
-    print(f"Fetching release metadata from [cyan]{settings.release_notes_url}[/cyan]...")
-    response = session.get(settings.release_notes_url)
+    settings = get_settings()
+    print(f"Fetching release metadata from [cyan]{settings.urls.release_notes_url}[/cyan]...")
+    response = session.get(settings.urls.release_notes_url)
     response.raise_for_status()
     content = response.text
 
@@ -100,8 +101,9 @@ def get_release_checksums(session: requests.Session) -> dict[str, str]:
     Raises:
         requests.exceptions.RequestException: If the checksum file cannot be downloaded.
     """
-    print(f"Fetching checksums from [cyan]{settings.checksums_url}[/cyan]...")
-    response = session.get(settings.checksums_url)
+    settings = get_settings()
+    print(f"Fetching checksums from [cyan]{settings.urls.checksums_url}[/cyan]...")
+    response = session.get(settings.urls.checksums_url)
     response.raise_for_status()
 
     checksums = {}
@@ -179,6 +181,7 @@ def run_extraction() -> dict[str, any]:
         RuntimeError: If metadata/checksums cannot be fetched or if a
                       downloaded file has a checksum mismatch.
     """
+    settings = get_settings()
     print("[bold blue]Starting UniProt data extraction...[/bold blue]")
     session = _create_retry_session()
 
@@ -189,24 +192,24 @@ def run_extraction() -> dict[str, any]:
         raise RuntimeError(f"Failed to get release metadata: {e}") from e
 
     # 2. Ensure data directory exists
-    settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"Data will be stored in: [green]{settings.DATA_DIR.resolve()}[/green]")
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Data will be stored in: [green]{settings.data_dir.resolve()}[/green]")
 
     # 3. Get official checksums
     try:
         checksums = get_release_checksums(session)
     except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"Failed to fetch checksums from {settings.checksums_url}") from e
+        raise RuntimeError(f"Failed to fetch checksums from {settings.urls.checksums_url}") from e
 
     # 4. Define files to download
     files_to_download = {
-        "uniprot_sprot.xml.gz": settings.swissprot_xml_url,
-        "uniprot_trembl.xml.gz": settings.trembl_xml_url,
+        "uniprot_sprot.xml.gz": settings.urls.swissprot_xml_url,
+        "uniprot_trembl.xml.gz": settings.urls.trembl_xml_url,
     }
 
     # 5. Download and verify each file
     for filename, url in files_to_download.items():
-        destination = settings.DATA_DIR / filename
+        destination = settings.data_dir / filename
         print(f"\n[bold]Processing {filename}...[/bold]")
 
         expected_checksum = checksums.get(filename)

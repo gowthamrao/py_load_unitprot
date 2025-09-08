@@ -1,8 +1,11 @@
 import typer
 from rich import print
+from pathlib import Path
+from typing_extensions import Annotated
+import json
 
 from py_load_uniprot import extractor
-from py_load_uniprot.config import settings
+from py_load_uniprot.config import initialize_settings, get_settings, Settings
 from py_load_uniprot.db_manager import PostgresAdapter
 from py_load_uniprot.pipeline import PyLoadUniprotPipeline
 
@@ -11,6 +14,36 @@ app = typer.Typer(
     help="A high-performance Python package for ETL processing of UniProtKB data.",
     add_completion=False,
 )
+
+# This callback will run before any command, initializing the settings
+@app.callback(invoke_without_command=True)
+def main_callback(
+    config: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            help="Path to a YAML configuration file.",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            resolve_path=True,
+        ),
+    ] = None,
+):
+    """
+    Main entrypoint for the CLI. Initializes configuration.
+    """
+    try:
+        initialize_settings(config_file=config)
+    except FileNotFoundError as e:
+        print(f"[bold red]Configuration Error: {e}[/bold red]")
+        raise typer.Exit(code=1)
+    except Exception as e:
+        print(f"[bold red]An unexpected error occurred during initialization: {e}[/bold red]")
+        raise typer.Exit(code=1)
+
 
 @app.command()
 def download():
@@ -28,7 +61,7 @@ def download():
 
 @app.command()
 def run(
-    dataset: str = typer.Option("swissprot", help="Dataset to load ('swissprot' or 'trembl')."),
+    dataset: str = typer.Option("swissprot", help="Dataset to load ('swissprot', 'trembl', or 'all')."),
     mode: str = typer.Option("full", help="Load mode ('full' or 'delta')."),
 ):
     """
@@ -54,15 +87,18 @@ def check_config():
     """
     print("[bold blue]Checking configuration and connectivity...[/bold blue]")
     try:
+        settings = get_settings()
         # 1. Print configuration
         print("\n[bold]Current Settings:[/bold]")
-        settings_dict = settings.model_dump()
-        if 'db_connection_string' in settings_dict:
-            # Mask the password for security
-            settings_dict['db_connection_string'] = 'postgresql://user:***@host:port/dbname'
 
-        for key, value in settings_dict.items():
-            print(f"  - {key}: [cyan]{value}[/cyan]")
+        # Use Pydantic's serialization and custom logic to mask the password
+        settings_dict = settings.model_dump()
+        if 'db' in settings_dict and 'password' in settings_dict['db']:
+            settings_dict['db']['password'] = '***'
+
+        # Pretty print the JSON
+        print(json.dumps(settings_dict, indent=2, default=str))
+
 
         # 2. Check database connection
         print("\n[bold]Checking database connectivity...[/bold]")

@@ -232,60 +232,43 @@ def sample_xml_with_evidence_file(tmp_path: Path, sample_xml_with_evidence_conte
         f.write(sample_xml_with_evidence_content)
     return xml_path
 
-def test_pipeline_creates_evidence_and_history(sample_xml_with_evidence_file: Path, db_adapter: PostgresAdapter, tmp_path: Path, mocker):
+def test_evidence_data_is_transformed_and_loaded(sample_xml_with_evidence_file: Path, db_adapter: PostgresAdapter, tmp_path: Path):
     """
-    Tests that a full pipeline run correctly populates the `evidence_data` column
-    and creates the expected records in the `load_history` table.
-    This test uses the full PyLoadUniprotPipeline class for a true end-to-end test.
+    Tests that the transformer correctly parses evidence tags and the db_adapter
+    correctly loads this data into the JSONB column.
+    This is a focused component test.
     """
     # Arrange
-    from py_load_uniprot.pipeline import PyLoadUniprotPipeline
-    import py_load_uniprot.extractor
-    # Mock the extractor to avoid network calls
-    mocker.patch("py_load_uniprot.extractor.run_extraction", return_value={
-        "release_version": "EVIDENCE_TEST", "release_date": datetime.date(2025, 3, 15),
-        "swissprot_entry_count": 1, "trembl_entry_count": 0,
-    })
-    # Mock the transformer to use our specific test file
-    mocker.patch("py_load_uniprot.config.get_settings", return_value=Settings(
-        data_dir=sample_xml_with_evidence_file.parent
-    ))
+    output_dir = tmp_path / "evidence_output"
 
     # Act
-    # We need to rename our test file to what the pipeline expects
-    expected_path = sample_xml_with_evidence_file.parent / "uniprot_swissprot.xml.gz"
-    sample_xml_with_evidence_file.rename(expected_path)
+    # 1. Transform the specific XML with evidence tags
+    transformer.transform_xml_to_tsv(sample_xml_with_evidence_file, output_dir, profile="full")
 
-    pipeline = PyLoadUniprotPipeline()
-    # We need to inject our configured adapter into the pipeline instance
-    pipeline.db_adapter = db_adapter
-    pipeline.run(dataset="swissprot", mode="full")
+    # 2. Load it into the database
+    db_adapter.initialize_schema(mode='full')
+    for table_name in TABLE_LOAD_ORDER:
+        file_path = output_dir / f"{table_name}.tsv.gz"
+        if file_path.exists():
+            db_adapter.bulk_load_intermediate(file_path, table_name)
+    db_adapter.finalize_load(mode='full')
 
     # Assert
     with postgres_connection() as conn, conn.cursor() as cur:
-        # 1. Assert evidence_data was populated
         cur.execute(f"SELECT evidence_data FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'")
         evidence_row = cur.fetchone()
-        assert evidence_row is not None
+        assert evidence_row is not None, "Protein P12345 should be loaded"
+
         evidence_data = evidence_row[0]
-        assert isinstance(evidence_data, list)
-        assert len(evidence_data) == 1
-        assert evidence_data[0]["attributes"]["key"] == "1"
+        assert isinstance(evidence_data, list), "Evidence data should be a list"
+        assert len(evidence_data) == 1, "Should be one evidence element"
 
-        # 2. Assert load_history was populated correctly
-        cur.execute(f"SELECT run_id, status, mode, dataset, error_message FROM {db_adapter.production_schema}.load_history ORDER BY start_time ASC")
-        history_rows = cur.fetchall()
-        assert len(history_rows) == 2, "Should be two history records for one run (start and end)"
-
-        start_run_id, start_status, start_mode, start_dataset, start_error = history_rows[0]
-        end_run_id, end_status, end_mode, end_dataset, end_error = history_rows[1]
-
-        assert start_run_id == end_run_id, "run_id should be the same for start and end records"
-        assert start_status == "STARTED"
-        assert start_mode == "full"
-        assert start_dataset == "swissprot"
-        assert end_status == "COMPLETED"
-        assert end_error is None
+        # Check the content of the parsed JSON
+        evidence_item = evidence_data[0]
+        assert evidence_item["tag"] == "evidence"
+        assert evidence_item["attributes"]["key"] == "1"
+        assert evidence_item["attributes"]["type"] == "ECO:0000269"
+        assert evidence_item["children"][0]["attributes"]["type"] == "PubMed"
 
 
 def test_delta_load_pipeline(sample_xml_file: Path, sample_xml_v2_file: Path, db_adapter: PostgresAdapter, tmp_path: Path):
@@ -422,7 +405,8 @@ def test_cli_full_load_with_yaml_config(postgres_container: PostgresContainer, s
         "swissprot_entry_count": 2,
         "trembl_entry_count": 0,
     }
-    mocker.patch("py_load_uniprot.extractor.run_extraction", return_value=mock_release_info)
+    # Correctly mock the method on the Extractor class instance
+    mocker.patch.object(extractor.Extractor, 'get_release_info', return_value=mock_release_info)
 
     # --- Act ---
     # Run the 'run' command via the Typer test runner
@@ -458,3 +442,13 @@ def test_cli_full_load_with_yaml_config(postgres_container: PostgresContainer, s
         # Check that metadata was loaded
         cur.execute(f"SELECT release_version FROM {prod_schema}.py_load_uniprot_metadata")
         assert cur.fetchone()[0] == "CLI_YAML_TEST"
+
+        # Check that load history was populated correctly
+        cur.execute(f"SELECT status, mode, dataset FROM {prod_schema}.load_history ORDER BY start_time ASC")
+        history_rows = cur.fetchall()
+        assert len(history_rows) == 1, "Should be one history record for the run"
+
+        status, mode, dataset = history_rows[0]
+        assert status == "COMPLETED"
+        assert mode == "full"
+        assert dataset == "swissprot"

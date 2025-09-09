@@ -22,7 +22,6 @@ TABLE_LOAD_ORDER = [
     "genes",
     "keywords",
     "protein_to_go",
-    "protein_to_taxonomy",
 ]
 TABLES_WITH_UNIQUE_CONSTRAINTS: dict[str, str] = {"taxonomy": "ncbi_taxid"}
 
@@ -304,10 +303,11 @@ class PostgresAdapter(DatabaseAdapter):
         """Orchestrates the SQL operations for a delta update."""
         print("Starting delta update process...")
 
-        # 1. Upsert core entities
+        # 1. Upsert core entities. Taxonomy must be upserted before proteins
+        #    to ensure foreign key constraints are met.
+        self._upsert_taxonomy(cur)
         self._upsert_proteins(cur)
         self._upsert_sequences(cur)
-        self._upsert_taxonomy(cur)
 
         # 2. Sync child tables (Delete old, insert new)
         self._sync_child_table(
@@ -318,10 +318,6 @@ class PostgresAdapter(DatabaseAdapter):
         self._sync_child_table(
             cur, "protein_to_go", ["protein_accession", "go_term_id"]
         )
-        self._sync_child_table(
-            cur, "protein_to_taxonomy", ["protein_accession", "ncbi_taxid"]
-        )
-
         # 3. Handle deleted proteins
         self._delete_removed_proteins(cur)
 
@@ -338,6 +334,7 @@ class PostgresAdapter(DatabaseAdapter):
         SELECT * FROM {self.staging_schema}.proteins
         ON CONFLICT (primary_accession) DO UPDATE SET
             uniprot_id = EXCLUDED.uniprot_id,
+            ncbi_taxid = EXCLUDED.ncbi_taxid,
             sequence_length = EXCLUDED.sequence_length,
             molecular_weight = EXCLUDED.molecular_weight,
             modified_date = EXCLUDED.modified_date,

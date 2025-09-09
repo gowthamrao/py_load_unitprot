@@ -7,6 +7,26 @@ SAMPLE_XML_CONTENT = """<?xml version="1.0" encoding="UTF-8"?>
   <accession>P12345</accession>
   <accession>Q9Y5Y5</accession>
   <name>TEST1_HUMAN</name>
+  <organism>
+    <name type="scientific">Oryctolagus cuniculus</name>
+    <name type="common">Rabbit</name>
+    <dbReference type="NCBI Taxonomy" id="9986"/>
+    <lineage>
+      <taxon>Eukaryota</taxon>
+      <taxon>Metazoa</taxon>
+      <taxon>Chordata</taxon>
+      <taxon>Craniata</taxon>
+      <taxon>Vertebrata</taxon>
+      <taxon>Euteleostomi</taxon>
+      <taxon>Mammalia</taxon>
+      <taxon>Eutheria</taxon>
+      <taxon>Euarchontoglires</taxon>
+      <taxon>Glires</taxon>
+      <taxon>Lagomorpha</taxon>
+      <taxon>Leporidae</taxon>
+      <taxon>Oryctolagus</taxon>
+    </lineage>
+  </organism>
   <sequence length="10" mass="1111" checksum="abcde" modified="2000-05-30" version="1">MTESTSEQ</sequence>
 </entry>
 <entry dataset="TrEMBL" created="2010-10-12" modified="2024-07-18" version="100">

@@ -1,0 +1,35 @@
+# -----------------------------------------------------------------------------
+# Example Configuration for py-load-uniprot
+# -----------------------------------------------------------------------------
+# This file provides a template for configuring the application.
+# You can copy this file to 'config.yaml' (or any other name) and modify it
+# for your environment. Then, run the application with the --config flag:
+#
+# py-load-uniprot --config /path/to/your/config.yaml run --dataset=swissprot
+#
+# Any setting defined here can also be overridden by environment variables.
+# The environment variable name is formed by the section and key, separated by
+# double underscores, and prefixed with 'PY_LOAD_UNIPROT_'.
+# Example: PY_LOAD_UNIPROT_DB__HOST=my-database.example.com
+# -----------------------------------------------------------------------------
+
+# --- Local Data Storage ---
+# The directory where downloaded UniProt files will be stored.
+data_dir: "data"
+
+# --- Database Connection Settings ---
+# This section configures the connection to your target PostgreSQL database.
+db:
+  host: "localhost"
+  port: 5432
+  user: "postgres"
+  password: "password"
+  dbname: "uniprot"
+
+# --- UniProt Source URLs ---
+# This section defines the URLs for fetching UniProt data.
+# It's generally not necessary to change these unless you are using a mirror.
+urls:
+  uniprot_ftp_base_url: "https://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/complete/"
+  release_notes_filename: "reldate.txt"
+  checksums_filename: "MD5SUMS"

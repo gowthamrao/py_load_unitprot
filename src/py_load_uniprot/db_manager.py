@@ -63,6 +63,11 @@ class DatabaseAdapter(ABC):
         pass
 
     @abstractmethod
+    def deduplicate_staging_data(self, table_name: str, unique_key: str) -> None:
+        """Removes duplicate rows from a staging table based on a unique key."""
+        pass
+
+    @abstractmethod
     def finalize_load(self, mode: str) -> None:
         """Performs post-load operations (e.g., indexing, analyzing, schema swapping, MERGE execution)."""
         pass
@@ -153,15 +158,10 @@ class PostgresAdapter(DatabaseAdapter):
 
     def bulk_load_intermediate(self, file_path: Path, table_name: str) -> None:
         """
-        Loads a single intermediate TSV.gz file into a table in the staging schema.
-        This implementation dispatches to a direct COPY or a safe UPSERT based
-        on whether the table has unique constraints that need handling.
+        Loads a single intermediate TSV.gz file into a table in the staging schema
+        using a direct COPY. De-duplication is handled in a separate step.
         """
-        unique_key = TABLES_WITH_UNIQUE_CONSTRAINTS.get(table_name)
-        if unique_key:
-            self._safe_upsert_load(file_path, table_name, unique_key)
-        else:
-            self._direct_copy_load(file_path, table_name)
+        self._direct_copy_load(file_path, table_name)
 
     def _direct_copy_load(self, file_path: Path, table_name: str) -> None:
         target = f"{self.staging_schema}.{table_name}"
@@ -172,33 +172,42 @@ class PostgresAdapter(DatabaseAdapter):
             gzip.open(file_path, "rt", encoding="utf-8") as f,
         ):
             header = f.readline().strip().split("\t")
+            # Use copy_expert for performance and to handle streaming data
             cur.copy_expert(
                 f"COPY {target} ({','.join(header)}) FROM STDIN WITH (FORMAT csv, DELIMITER E'\\t', HEADER false)",
                 f,
             )
             conn.commit()
 
-    def _safe_upsert_load(
-        self, file_path: Path, table_name: str, unique_key: str
-    ) -> None:
-        target = f"{self.staging_schema}.{table_name}"
-        temp_table = f"temp_{table_name}"
-        print(f"Performing safe upsert for '{table_name}'...")
+    def deduplicate_staging_data(self, table_name: str, unique_key: str) -> None:
+        """
+        Removes duplicate rows from a staging table based on a unique key,
+        keeping the first row encountered.
+        """
+        print(
+            f"De-duplicating data in staging table '{table_name}' on key '{unique_key}'..."
+        )
+        # This CTE-based DELETE is highly efficient in PostgreSQL for removing duplicates.
+        # It identifies all rows but the first one for each unique key and deletes them.
+        sql = f"""
+        WITH numbered_rows AS (
+            SELECT ctid,
+                   row_number() OVER (PARTITION BY {unique_key} ORDER BY ctid) as rn
+            FROM {self.staging_schema}.{table_name}
+        )
+        DELETE FROM {self.staging_schema}.{table_name}
+        WHERE ctid IN (SELECT ctid FROM numbered_rows WHERE rn > 1);
+        """
         with postgres_connection(self.settings) as conn, conn.cursor() as cur:
-            cur.execute(
-                f"CREATE TEMP TABLE {temp_table} ON COMMIT DROP AS TABLE {target} WITH NO DATA;"
-            )
-            with gzip.open(file_path, "rt", encoding="utf-8") as f:
-                header = f.readline().strip().split("\t")
-                cur.copy_expert(
-                    f"COPY {temp_table} ({','.join(header)}) FROM STDIN WITH (FORMAT csv, DELIMITER E'\\t', HEADER false)",
-                    f,
-                )
-            cols = TABLE_HEADERS[table_name]
-            cur.execute(
-                f"INSERT INTO {target} ({', '.join(cols)}) SELECT * FROM {temp_table} ON CONFLICT ({unique_key}) DO NOTHING;"
-            )
+            cur.execute(sql)
+            deleted_count = cur.rowcount
             conn.commit()
+        if deleted_count > 0:
+            print(
+                f"Removed [bold yellow]{deleted_count}[/bold yellow] duplicate row(s) from '{table_name}'."
+            )
+        else:
+            print(f"No duplicate rows found in '{table_name}'.")
 
     def _create_indexes(self, cur: cursor) -> None:
         print(f"Creating indexes on schema '{self.staging_schema}'...")

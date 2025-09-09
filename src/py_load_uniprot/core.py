@@ -15,7 +15,11 @@ from rich.markup import escape
 
 from py_load_uniprot import extractor, transformer
 from py_load_uniprot.config import Settings, load_settings
-from py_load_uniprot.db_manager import TABLE_LOAD_ORDER, PostgresAdapter
+from py_load_uniprot.db_manager import (
+    TABLE_LOAD_ORDER,
+    TABLES_WITH_UNIQUE_CONSTRAINTS,
+    PostgresAdapter,
+)
 
 
 class PyLoadUniprotPipeline:
@@ -121,13 +125,19 @@ class PyLoadUniprotPipeline:
             for ds in datasets_to_process:
                 self._transform_and_load_single_dataset(ds)
 
-            # Step 4: Finalize Load
-            print("\n[bold]Step 4: Finalizing database load...[/bold]")
+            # Step 4: De-duplicate Staging Area
+            print("\n[bold]Step 4: De-duplicating staging area...[/bold]")
+            for table, key in TABLES_WITH_UNIQUE_CONSTRAINTS.items():
+                self.db_adapter.deduplicate_staging_data(table, key)
+            print("[green]De-duplication complete.[/green]")
+
+            # Step 5: Finalize Load
+            print("\n[bold]Step 5: Finalizing database load...[/bold]")
             self.db_adapter.finalize_load(mode=mode)
             print("[green]Finalization complete.[/green]")
 
-            # Step 5: Update Metadata
-            print("\n[bold]Step 5: Updating release metadata...[/bold]")
+            # Step 6: Update Metadata
+            print("\n[bold]Step 6: Updating release metadata...[/bold]")
             self.db_adapter.update_metadata(release_info)
             print("[green]Metadata update complete.[/green]")
 

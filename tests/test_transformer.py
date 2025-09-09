@@ -1,8 +1,10 @@
-import pytest
-import gzip
 import csv
+import gzip
 import json
 from pathlib import Path
+
+import pytest
+
 from py_load_uniprot import transformer
 
 # Using the more comprehensive XML sample to test all parsing features
@@ -45,6 +47,7 @@ SAMPLE_XML_CONTENT = """<?xml version="1.0" encoding="UTF-8"?>
 </uniprot>
 """
 
+
 @pytest.fixture
 def sample_xml_file(tmp_path: Path) -> Path:
     """Creates a gzipped sample XML file for testing."""
@@ -53,13 +56,17 @@ def sample_xml_file(tmp_path: Path) -> Path:
         f.write(SAMPLE_XML_CONTENT)
     return xml_path
 
+
 def read_tsv_gz(file_path: Path) -> list[list[str]]:
     """Helper function to read a gzipped TSV file."""
     with gzip.open(file_path, "rt", encoding="utf-8") as f:
         reader = csv.reader(f, delimiter="\t")
         return list(reader)
 
-def test_transform_xml_to_tsv_creates_correct_output(sample_xml_file: Path, tmp_path: Path):
+
+def test_transform_xml_to_tsv_creates_correct_output(
+    sample_xml_file: Path, tmp_path: Path
+):
     """
     Tests that the transformer correctly parses a sample XML and produces
     the expected set of TSV files with correct content.
@@ -81,32 +88,54 @@ def test_transform_xml_to_tsv_creates_correct_output(sample_xml_file: Path, tmp_
 
         file_path = output_dir / f"{table_name}.tsv.gz"
         # Only assert file existence if it should have data
-        if table_name in ["proteins", "sequences", "accessions", "taxonomy", "protein_to_taxonomy", "genes", "protein_to_go", "keywords"]:
-             assert file_path.exists(), f"File for table '{table_name}' should exist"
+        if table_name in [
+            "proteins",
+            "sequences",
+            "accessions",
+            "taxonomy",
+            "protein_to_taxonomy",
+            "genes",
+            "protein_to_go",
+            "keywords",
+        ]:
+            assert file_path.exists(), f"File for table '{table_name}' should exist"
 
     # --- Assert proteins.tsv.gz ---
     proteins_rows = read_tsv_gz(output_dir / "proteins.tsv.gz")
     assert proteins_rows[0] == transformer.TABLE_HEADERS["proteins"]
-    protein_data = sorted(proteins_rows[1:], key=lambda r: r[0]) # Sort by accession
+    protein_data = sorted(proteins_rows[1:], key=lambda r: r[0])  # Sort by accession
     assert len(protein_data) == 2
 
     # Check P12345
     p1_row = protein_data[0]
-    assert p1_row[0:6] == ["P12345", "TEST1_HUMAN", "10", "1111", "2000-05-30", "2024-07-17"]
-    assert json.loads(p1_row[6])[0]['tag'] == 'comment'
-    assert json.loads(p1_row[7])[0]['tag'] == 'feature'
-    assert p1_row[8] == ''
+    assert p1_row[0:6] == [
+        "P12345",
+        "TEST1_HUMAN",
+        "10",
+        "1111",
+        "2000-05-30",
+        "2024-07-17",
+    ]
+    assert json.loads(p1_row[6])[0]["tag"] == "comment"
+    assert json.loads(p1_row[7])[0]["tag"] == "feature"
+    assert p1_row[8] == ""
 
     # Check P67890
     p2_row = protein_data[1]
-    assert p2_row[0:6] == ["P67890", "TEST2_MOUSE", "12", "2222", "2010-10-12", "2024-07-18"]
-
+    assert p2_row[0:6] == [
+        "P67890",
+        "TEST2_MOUSE",
+        "12",
+        "2222",
+        "2010-10-12",
+        "2024-07-18",
+    ]
 
     # --- Assert other tables (with sorting where necessary) ---
     accessions_rows = read_tsv_gz(output_dir / "accessions.tsv.gz")
     assert accessions_rows == [
         transformer.TABLE_HEADERS["accessions"],
-        ["P12345", "Q9Y5Y5"]
+        ["P12345", "Q9Y5Y5"],
     ]
 
     sequences_rows = read_tsv_gz(output_dir / "sequences.tsv.gz")
@@ -116,28 +145,26 @@ def test_transform_xml_to_tsv_creates_correct_output(sample_xml_file: Path, tmp_
     assert sequence_data[1] == ["P67890", "MTESTSEQBBBB"]
 
     taxonomy_rows = read_tsv_gz(output_dir / "taxonomy.tsv.gz")
-    taxonomy_data = sorted(taxonomy_rows[1:], key=lambda r: r[0]) # Sort by taxid
+    taxonomy_data = sorted(taxonomy_rows[1:], key=lambda r: r[0])  # Sort by taxid
     assert len(taxonomy_data) == 2
     assert taxonomy_data[0] == ["10090", "Mus musculus", "Eukaryota > Metazoa"]
     assert taxonomy_data[1] == ["9606", "Homo sapiens", "Eukaryota > Metazoa"]
 
     genes_rows = read_tsv_gz(output_dir / "genes.tsv.gz")
-    assert genes_rows == [
-        transformer.TABLE_HEADERS["genes"],
-        ["P12345", "TP1", "True"]
-    ]
+    assert genes_rows == [transformer.TABLE_HEADERS["genes"], ["P12345", "TP1", "True"]]
 
     go_rows = read_tsv_gz(output_dir / "protein_to_go.tsv.gz")
     assert go_rows == [
         transformer.TABLE_HEADERS["protein_to_go"],
-        ["P12345", "GO:0005515"]
+        ["P12345", "GO:0005515"],
     ]
 
     keywords_rows = read_tsv_gz(output_dir / "keywords.tsv.gz")
     assert keywords_rows == [
         transformer.TABLE_HEADERS["keywords"],
-        ["P12345", "KW-0181", "Complete proteome"]
+        ["P12345", "KW-0181", "Complete proteome"],
     ]
+
 
 def test_parse_entry_extracts_evidence_data():
     """
@@ -146,6 +173,7 @@ def test_parse_entry_extracts_evidence_data():
     """
     # Arrange
     from lxml import etree
+
     xml_string = """
 <entry created="2000-05-30" modified="2024-07-17" version="150" xmlns="http://uniprot.org/uniprot">
   <accession>P12345</accession>
@@ -182,28 +210,40 @@ def test_parse_entry_extracts_evidence_data():
     assert len(evidence_list) == 2
 
     # Check for evidence key "1"
-    evidence_1 = next((e for e in evidence_list if e.get("attributes", {}).get("key") == "1"), None)
+    evidence_1 = next(
+        (e for e in evidence_list if e.get("attributes", {}).get("key") == "1"), None
+    )
     assert evidence_1 is not None
     assert evidence_1["attributes"]["type"] == "ECO:0000269"
     assert evidence_1["children"][0]["tag"] == "source"
 
     # Check for evidence key "2"
-    evidence_2 = next((e for e in evidence_list if e.get("attributes", {}).get("key") == "2"), None)
+    evidence_2 = next(
+        (e for e in evidence_list if e.get("attributes", {}).get("key") == "2"), None
+    )
     assert evidence_2 is not None
     assert evidence_2["attributes"]["type"] == "ECO:0000256"
 
 
 # --- Test for parallel implementation ---
 
-def transform_xml_to_tsv_single_threaded(xml_file: Path, output_dir: Path, profile: str):
+
+def transform_xml_to_tsv_single_threaded(
+    xml_file: Path, output_dir: Path, profile: str
+):
     """
     A single-threaded version of the transformer, kept for baseline comparison.
     """
     from lxml import etree
 
     # This is a recreation of the original single-threaded implementation
-    with gzip.open(xml_file, "rb") as f_in, transformer.FileWriterManager(output_dir) as writers:
-        context = etree.iterparse(f_in, events=("end",), tag=transformer._get_tag("entry"))
+    with (
+        gzip.open(xml_file, "rb") as f_in,
+        transformer.FileWriterManager(output_dir) as writers,
+    ):
+        context = etree.iterparse(
+            f_in, events=("end",), tag=transformer._get_tag("entry")
+        )
         seen_taxonomy_ids = set()
 
         for _, elem in context:
@@ -226,7 +266,10 @@ def transform_xml_to_tsv_single_threaded(xml_file: Path, output_dir: Path, profi
             while elem.getprevious() is not None:
                 del elem.getparent()[0]
 
-def test_parallel_transformer_matches_single_threaded(sample_xml_file: Path, tmp_path: Path):
+
+def test_parallel_transformer_matches_single_threaded(
+    sample_xml_file: Path, tmp_path: Path
+):
     """
     Verifies that the parallel transformer produces the exact same output as
     the original single-threaded implementation.
@@ -241,13 +284,17 @@ def test_parallel_transformer_matches_single_threaded(sample_xml_file: Path, tmp
     # Run single-threaded version
     transform_xml_to_tsv_single_threaded(sample_xml_file, output_single, profile="full")
     # Run parallel version
-    transformer.transform_xml_to_tsv(sample_xml_file, output_parallel, profile="full", num_workers=2)
+    transformer.transform_xml_to_tsv(
+        sample_xml_file, output_parallel, profile="full", num_workers=2
+    )
 
     # Assert
     # Check that the same files were created
     single_files = sorted([p.name for p in output_single.glob("*.tsv.gz")])
     parallel_files = sorted([p.name for p in output_parallel.glob("*.tsv.gz")])
-    assert single_files == parallel_files, "The set of created files should be identical"
+    assert (
+        single_files == parallel_files
+    ), "The set of created files should be identical"
     assert len(single_files) > 0, "At least one file should have been created"
 
     # Check the content of each file
@@ -258,7 +305,11 @@ def test_parallel_transformer_matches_single_threaded(sample_xml_file: Path, tmp
         # Sort content to account for non-deterministic order of processing
         # Header should be the same, so we sort data rows
         single_header, single_data = single_content[0], sorted(single_content[1:])
-        parallel_header, parallel_data = parallel_content[0], sorted(parallel_content[1:])
+        parallel_header, parallel_data = parallel_content[0], sorted(
+            parallel_content[1:]
+        )
 
         assert single_header == parallel_header, f"Headers in {filename} should match"
-        assert single_data == parallel_data, f"Data in {filename} should match after sorting"
+        assert (
+            single_data == parallel_data
+        ), f"Data in {filename} should match after sorting"

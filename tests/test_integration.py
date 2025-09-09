@@ -403,6 +403,14 @@ def test_delta_load_pipeline(
             cur.fetchone()[0] == "TEST3_NEW"
         ), "New protein A0A0A0 should have been inserted."
 
+        # Check that the child table (genes) was synced correctly via MERGE
+        cur.execute(
+            f"SELECT gene_name FROM {pipeline.db_adapter.production_schema}.genes WHERE protein_accession = 'P12345' AND is_primary = TRUE"
+        )
+        assert (
+            cur.fetchone()[0] == "TP1_UPDATED"
+        ), "Primary gene name for P12345 should have been updated in child table."
+
         # Check that metadata was updated to V2
         cur.execute(
             f"SELECT version FROM {pipeline.db_adapter.production_schema}.py_load_uniprot_metadata"

@@ -98,18 +98,23 @@ class Extractor:
                 if r.status_code not in (200, 206):
                     r.raise_for_status()
 
-                if r.status_code == 200: # Full download
-                    print("Server does not support range requests. Starting full download.")
+                if r.status_code == 200:  # Full download
+                    print(
+                        "Server does not support range requests. Starting full download."
+                    )
                     downloaded_size = 0
                     file_mode = "wb"
-                elif r.status_code == 206: # Partial download
+                elif r.status_code == 206:  # Partial download
                     print("Server supports range requests. Resuming download.")
 
                 total_size = int(r.headers.get("content-length", 0)) + downloaded_size
 
                 progress = self._get_progress_bar()
                 task_id = progress.add_task(
-                    "download", total=total_size, completed=downloaded_size, filename=filename
+                    "download",
+                    total=total_size,
+                    completed=downloaded_size,
+                    filename=filename,
                 )
 
                 with open(local_path, file_mode) as f, progress:

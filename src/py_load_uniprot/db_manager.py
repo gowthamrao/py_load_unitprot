@@ -66,13 +66,8 @@ class DatabaseAdapter(ABC):
         pass
 
     @abstractmethod
-    def log_run_start(self, run_id: str, mode: str, dataset: str) -> None:
-        """Logs the start of a pipeline run."""
-        pass
-
-    @abstractmethod
-    def log_run_end(self, run_id: str, status: str, error_message: str | None = None) -> None:
-        """Logs the end of a pipeline run with its final status."""
+    def log_run(self, run_id: str, mode: str, dataset: str, status: str, start_time: datetime, end_time: datetime, error_message: str | None = None) -> None:
+        """Logs a pipeline run to the history table."""
         pass
 
 class PostgresAdapter(DatabaseAdapter):
@@ -412,46 +407,32 @@ class PostgresAdapter(DatabaseAdapter):
             print(f"[yellow]Metadata table not found in schema '{self.production_schema}'. Database may not be initialized.[/yellow]")
             return None
 
-    def log_run_start(self, run_id: str, mode: str, dataset: str) -> None:
+    def log_run(self, run_id: str, mode: str, dataset: str, status: str, start_time: datetime, end_time: datetime, error_message: str | None = None) -> None:
         """
-        Inserts a new record into the load_history table to mark the start of a run.
-        The log is written to the production schema so it persists.
+        Inserts a single, complete record into the load_history table.
         """
-        print(f"Logging pipeline run start for run_id: [cyan]{run_id}[/cyan]")
+        color = "green" if status == "COMPLETED" else "red"
+        print(f"Logging pipeline run for run_id: [cyan]{run_id}[/cyan] with status [{color}][bold]{status}[/bold][/{color}]")
         sql = f"""
         INSERT INTO {self.production_schema}.load_history (
-            run_id, status, mode, dataset, start_time
+            run_id, status, mode, dataset, start_time, end_time, error_message
         ) VALUES (
-            %(run_id)s, 'STARTED', %(mode)s, %(dataset)s, NOW()
+            %(run_id)s, %(status)s, %(mode)s, %(dataset)s, %(start_time)s, %(end_time)s, %(error_message)s
         );
         """
         try:
             with postgres_connection() as conn, conn.cursor() as cur:
                 # Ensure the production schema and table exist before logging
                 self._create_production_schema_if_not_exists(cur)
-                cur.execute(sql, {"run_id": run_id, "mode": mode, "dataset": dataset})
+                cur.execute(sql, {
+                    "run_id": run_id,
+                    "status": status,
+                    "mode": mode,
+                    "dataset": dataset,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "error_message": error_message,
+                })
                 conn.commit()
         except Exception as e:
-            print(f"[bold red]Failed to log pipeline start: {e}[/bold red]")
-            # We don't re-raise here because logging failure should not stop the main pipeline
-
-    def log_run_end(self, run_id: str, status: str, error_message: str | None = None) -> None:
-        """
-        Updates the corresponding run record in load_history with the final
-        status and end time.
-        """
-        color = "green" if status == "COMPLETED" else "red"
-        print(f"Logging pipeline run end for run_id: [cyan]{run_id}[/cyan] with status [{color}][bold]{status}[/bold][/{color}]")
-        sql = f"""
-        UPDATE {self.production_schema}.load_history
-        SET status = %(status)s,
-            end_time = NOW(),
-            error_message = %(error_message)s
-        WHERE run_id = %(run_id)s;
-        """
-        try:
-            with postgres_connection() as conn, conn.cursor() as cur:
-                cur.execute(sql, {"run_id": run_id, "status": status, "error_message": error_message})
-                conn.commit()
-        except Exception as e:
-            print(f"[bold red]Failed to log pipeline end: {e}[/bold red]")
+            print(f"[bold red]Failed to log pipeline run: {e}[/bold red]")

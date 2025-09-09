@@ -19,6 +19,7 @@ TABLE_HEADERS: dict[str, list[str]] = {
     "proteins": [
         "primary_accession",
         "uniprot_id",
+        "ncbi_taxid",
         "sequence_length",
         "molecular_weight",
         "created_date",
@@ -31,7 +32,6 @@ TABLE_HEADERS: dict[str, list[str]] = {
     "sequences": ["primary_accession", "sequence"],
     "accessions": ["protein_accession", "secondary_accession"],
     "taxonomy": ["ncbi_taxid", "scientific_name", "lineage"],
-    "protein_to_taxonomy": ["protein_accession", "ncbi_taxid"],
     "genes": ["protein_accession", "gene_name", "is_primary"],
     "protein_to_go": ["protein_accession", "go_term_id"],
     "keywords": ["protein_accession", "keyword_id", "keyword_label"],
@@ -166,19 +166,26 @@ def _parse_entry(elem: etree._Element, profile: str) -> dict[str, list[Any]]:
             data["accessions"].append([primary_accession, acc_elem.text])
 
     # --- Taxonomy ---
+    ncbi_taxid = None
     org_elem = elem.find(_get_tag("organism"))
     if org_elem is not None:
-        taxid = org_elem.find(_get_tag("dbReference")).get("id")
-        if taxid:
-            taxid = int(taxid)
+        # Robustly find the taxonomy ID
+        db_ref_elem = org_elem.find(f'.//{_get_tag("dbReference")}[@type="NCBI Taxonomy"]')
+        if db_ref_elem is not None and db_ref_elem.get("id"):
+            ncbi_taxid = int(db_ref_elem.get("id"))
             scientific_name = org_elem.findtext(_get_tag("name"))
             lineage_list = [
                 t.text
                 for t in org_elem.findall(_get_tag("lineage") + "/" + _get_tag("taxon"))
+                if t.text
             ]
             lineage = " > ".join(lineage_list)
-            data["taxonomy"].append([taxid, scientific_name, lineage])
-            data["protein_to_taxonomy"].append([primary_accession, taxid])
+            data["taxonomy"].append([ncbi_taxid, scientific_name, lineage])
+
+    # Add the extracted ncbi_taxid to the protein data.
+    # It will be None if not found, which is handled by the database schema (allows NULL).
+    protein_row = data["proteins"][0]
+    protein_row.insert(2, ncbi_taxid) # Insert taxid after uniprot_id
 
     # --- Genes ---
     for gene_elem in elem.findall(_get_tag("gene")):

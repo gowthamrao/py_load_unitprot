@@ -5,7 +5,6 @@ import multiprocessing
 import os
 from collections import defaultdict
 from contextlib import contextmanager
-from multiprocessing import Queue
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
@@ -95,9 +94,7 @@ def _worker_parse_entry(
             results_queue.put({})  # Put an empty dict to not stall the writer
 
 
-def _parse_entry(
-    elem: etree._Element, profile: str
-) -> dict[str, list[Any]]:
+def _parse_entry(elem: etree._Element, profile: str) -> dict[str, list[Any]]:
     """
     Parses a single <entry> element from the UniProt XML and extracts data
     for all target tables.

@@ -4,13 +4,12 @@ from pathlib import Path
 
 import psycopg2
 import pytest
-import yaml
 from testcontainers.postgres import PostgresContainer
 from typer.testing import CliRunner
 
 from py_load_uniprot import extractor, transformer
 from py_load_uniprot.cli import app
-from py_load_uniprot.config import Settings, initialize_settings
+from py_load_uniprot.config import initialize_settings
 from py_load_uniprot.db_manager import (
     TABLE_LOAD_ORDER,
     PostgresAdapter,
@@ -87,7 +86,7 @@ def db_adapter(postgres_container: PostgresContainer):
     This fixture allows for component-level testing of the db_adapter.
     """
     from py_load_uniprot import config
-    from py_load_uniprot.config import get_settings, initialize_settings
+    from py_load_uniprot.config import get_settings
 
     config._settings = None
     # Initialize settings with the test database connection details
@@ -518,9 +517,7 @@ def test_cli_full_load_with_env_vars(
         assert cur.fetchone()[0] == 2
 
         # Check that metadata was loaded
-        cur.execute(
-            f"SELECT version FROM {prod_schema}.py_load_uniprot_metadata"
-        )
+        cur.execute(f"SELECT version FROM {prod_schema}.py_load_uniprot_metadata")
         assert cur.fetchone()[0] == "CLI_ENV_TEST"
 
         # Check that load history was populated correctly

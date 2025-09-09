@@ -23,7 +23,9 @@ class DBSettings(BaseModel):
 
 
 class URLSettings(BaseModel):
-    uniprot_ftp_base_url: str = "https://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/complete/"
+    uniprot_ftp_base_url: str = (
+        "https://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/complete/"
+    )
     release_notes_filename: str = "reldate.txt"
     checksums_filename: str = "MD5SUMS"
 

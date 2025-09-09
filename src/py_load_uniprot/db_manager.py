@@ -176,7 +176,9 @@ class PostgresAdapter(DatabaseAdapter):
             )
             conn.commit()
 
-    def _safe_upsert_load(self, file_path: Path, table_name: str, unique_key: str) -> None:
+    def _safe_upsert_load(
+        self, file_path: Path, table_name: str, unique_key: str
+    ) -> None:
         target = f"{self.staging_schema}.{table_name}"
         temp_table = f"temp_{table_name}"
         print(f"Performing safe upsert for '{table_name}'...")
@@ -403,9 +405,7 @@ class PostgresAdapter(DatabaseAdapter):
 
         print(f"Found {len(deleted_accessions)} proteins to delete.")
         # The CASCADE on the foreign key will handle deletion from all child tables
-        delete_sql = (
-            f"DELETE FROM {self.production_schema}.proteins WHERE primary_accession = ANY(%s);"
-        )
+        delete_sql = f"DELETE FROM {self.production_schema}.proteins WHERE primary_accession = ANY(%s);"
         cur.execute(delete_sql, (deleted_accessions,))
         print(
             f"{cur.rowcount} proteins and their related data deleted from production."

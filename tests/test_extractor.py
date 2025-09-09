@@ -2,6 +2,7 @@
 Unit tests for the Extractor module.
 """
 
+import datetime
 import hashlib
 import json
 from pathlib import Path
@@ -148,9 +149,6 @@ def test_verify_checksum_not_found(extractor: Extractor, temp_data_dir: Path):
     # --- Act & Assert ---
     # Should return True and print a warning
     assert extractor.verify_checksum(file_path) is True
-
-
-import datetime
 
 
 @patch("requests.Session.get")

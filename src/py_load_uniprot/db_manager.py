@@ -1,5 +1,6 @@
 import gzip
 import importlib.resources
+import uuid
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from datetime import datetime
@@ -10,7 +11,7 @@ import psycopg2
 from psycopg2.extensions import connection, cursor
 from rich import print
 
-from py_load_uniprot.config import get_settings
+from py_load_uniprot.config import Settings
 from py_load_uniprot.transformer import TABLE_HEADERS
 
 TABLE_LOAD_ORDER = [
@@ -27,8 +28,7 @@ TABLES_WITH_UNIQUE_CONSTRAINTS: dict[str, str] = {"taxonomy": "ncbi_taxid"}
 
 
 @contextmanager
-def postgres_connection() -> Iterator[connection]:
-    settings = get_settings()
+def postgres_connection(settings: Settings) -> Iterator[connection]:
     conn = None
     try:
         conn = psycopg2.connect(settings.db.connection_string)
@@ -95,9 +95,11 @@ class DatabaseAdapter(ABC):
 class PostgresAdapter(DatabaseAdapter):
     def __init__(
         self,
+        settings: Settings,
         staging_schema: str = "uniprot_staging",
         production_schema: str = "uniprot_public",
     ) -> None:
+        self.settings = settings
         self.staging_schema = staging_schema
         self.production_schema = production_schema
         print(
@@ -106,13 +108,13 @@ class PostgresAdapter(DatabaseAdapter):
 
     def check_connection(self) -> None:
         """Establishes a connection and performs a simple query."""
-        with postgres_connection() as conn, conn.cursor() as cur:
+        with postgres_connection(self.settings) as conn, conn.cursor() as cur:
             cur.execute("SELECT 1;")
         print("[green]Database connection verified.[/green]")
 
     def create_production_schema(self) -> None:
         """Creates the production schema and tables if they don't exist."""
-        with postgres_connection() as conn, conn.cursor() as cur:
+        with postgres_connection(self.settings) as conn, conn.cursor() as cur:
             self._create_production_schema_if_not_exists(cur)
             conn.commit()
 
@@ -142,7 +144,7 @@ class PostgresAdapter(DatabaseAdapter):
         print(
             f"Initializing database schema in [cyan]'{self.staging_schema}'[/cyan] for mode '{mode}'..."
         )
-        with postgres_connection() as conn, conn.cursor() as cur:
+        with postgres_connection(self.settings) as conn, conn.cursor() as cur:
             # In both full and delta modes, we start with a clean staging schema
             cur.execute(f"DROP SCHEMA IF EXISTS {self.staging_schema} CASCADE;")
             cur.execute(self._get_schema_ddl(self.staging_schema))
@@ -165,7 +167,7 @@ class PostgresAdapter(DatabaseAdapter):
         target = f"{self.staging_schema}.{table_name}"
         print(f"Performing direct COPY for '{table_name}'...")
         with (
-            postgres_connection() as conn,
+            postgres_connection(self.settings) as conn,
             conn.cursor() as cur,
             gzip.open(file_path, "rt", encoding="utf-8") as f,
         ):
@@ -182,7 +184,7 @@ class PostgresAdapter(DatabaseAdapter):
         target = f"{self.staging_schema}.{table_name}"
         temp_table = f"temp_{table_name}"
         print(f"Performing safe upsert for '{table_name}'...")
-        with postgres_connection() as conn, conn.cursor() as cur:
+        with postgres_connection(self.settings) as conn, conn.cursor() as cur:
             cur.execute(
                 f"CREATE TEMP TABLE {temp_table} ON COMMIT DROP AS TABLE {target} WITH NO DATA;"
             )
@@ -224,14 +226,16 @@ class PostgresAdapter(DatabaseAdapter):
         print(
             "[bold blue]Finalizing full load: creating indexes and performing schema swap...[/bold blue]"
         )
-        with postgres_connection() as conn, conn.cursor() as cur:
+        with postgres_connection(self.settings) as conn, conn.cursor() as cur:
             self._create_indexes(cur)
             self._analyze_schema(cur)
 
             # Perform the atomic swap
             print("Performing atomic schema swap...")
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            archive_schema_name = f"{self.production_schema}_old_{timestamp}"
+            archive_schema_name = (
+                f"{self.production_schema}_old_{timestamp}_{uuid.uuid4().hex[:8]}"
+            )
 
             cur.execute(
                 "SELECT 1 FROM pg_namespace WHERE nspname = %s",
@@ -262,7 +266,7 @@ class PostgresAdapter(DatabaseAdapter):
         print(
             "[bold blue]Finalizing delta load: merging staging into production...[/bold blue]"
         )
-        with postgres_connection() as conn, conn.cursor() as cur:
+        with postgres_connection(self.settings) as conn, conn.cursor() as cur:
             self._create_production_schema_if_not_exists(cur)
             self._execute_delta_update(cur)
             conn.commit()
@@ -437,7 +441,7 @@ class PostgresAdapter(DatabaseAdapter):
             %(trembl_entry_count)s
         );
         """
-        with postgres_connection() as conn, conn.cursor() as cur:
+        with postgres_connection(self.settings) as conn, conn.cursor() as cur:
             # Ensure the table exists before trying to truncate/insert
             self._create_metadata_tables(cur, self.production_schema)
             cur.execute(truncate_sql)
@@ -452,7 +456,7 @@ class PostgresAdapter(DatabaseAdapter):
         )
         sql = f"SELECT version FROM {self.production_schema}.py_load_uniprot_metadata ORDER BY load_timestamp DESC LIMIT 1;"
         try:
-            with postgres_connection() as conn, conn.cursor() as cur:
+            with postgres_connection(self.settings) as conn, conn.cursor() as cur:
                 cur.execute(sql)
                 result = cur.fetchone()
                 if result:
@@ -495,7 +499,7 @@ class PostgresAdapter(DatabaseAdapter):
         );
         """
         try:
-            with postgres_connection() as conn, conn.cursor() as cur:
+            with postgres_connection(self.settings) as conn, conn.cursor() as cur:
                 # Ensure the production schema and table exist before logging
                 self._create_production_schema_if_not_exists(cur)
                 cur.execute(

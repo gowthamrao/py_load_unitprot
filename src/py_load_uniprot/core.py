@@ -1,5 +1,5 @@
 """
-This module contains the main ETL pipeline orchestration logic.
+This module contains the public, high-level API for the py-load-uniprot package.
 """
 
 import datetime
@@ -8,32 +8,54 @@ import tempfile
 import traceback
 import uuid
 from pathlib import Path
+from typing import Optional
 
 from rich import print
 from rich.markup import escape
 
 from py_load_uniprot import extractor, transformer
-from py_load_uniprot.config import get_settings
+from py_load_uniprot.config import Settings, load_settings
 from py_load_uniprot.db_manager import TABLE_LOAD_ORDER, PostgresAdapter
 
 
 class PyLoadUniprotPipeline:
     """
-    Orchestrates the entire UniProt ETL process, from data extraction to database loading.
-    This class is designed to be used programmatically, for example in workflow managers.
+    Orchestrates the entire UniProt ETL process.
+
+    This is the main entry point for programmatic use of the package.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, settings: Settings) -> None:
         """
-        Initializes the pipeline and the database adapter.
+        Initializes the pipeline with a given configuration.
+
+        Args:
+            settings: A populated Settings object. It is recommended to use
+                      the `from_config_file` classmethod or the `load_settings`
+                      factory function to create this.
         """
         print("[bold blue]Pipeline initialized.[/bold blue]")
-        self.db_adapter = PostgresAdapter()
+        self.settings = settings
+        self.db_adapter = PostgresAdapter(settings)
+
+    @classmethod
+    def from_config_file(cls, config_file: Optional[Path] = None) -> "PyLoadUniprotPipeline":
+        """
+        A convenience factory method to create a pipeline instance directly
+        from a configuration file path.
+
+        Args:
+            config_file: Optional path to a YAML configuration file.
+
+        Returns:
+            An instance of the PyLoadUniprotPipeline.
+        """
+        settings = load_settings(config_file)
+        return cls(settings)
 
     def run(self, dataset: str, mode: str) -> None:
         """
         Executes the full ETL pipeline for a specified dataset(s) and load mode.
-        Includes comprehensive status logging to the `load_history` table.
 
         Args:
             dataset: The dataset to load ('swissprot', 'trembl', or 'all').
@@ -64,11 +86,31 @@ class PyLoadUniprotPipeline:
                 ["swissprot", "trembl"] if dataset == "all" else [dataset]
             )
 
-            # Step 1: Extraction
-            print("\n[bold]Step 1: Running data extraction...[/bold]")
-            data_extractor = extractor.Extractor(get_settings())
+            # Step 1: Extraction and Version Check
+            print("\n[bold]Step 1: Running data extraction and version check...[/bold]")
+            data_extractor = extractor.Extractor(self.settings)
             release_info = data_extractor.get_release_info()
-            print("[green]Extraction complete.[/green]")
+
+            if mode == "delta":
+                current_db_version = self.db_adapter.get_current_release_version()
+                new_version = release_info.get("version")
+                if current_db_version and new_version:
+                    if current_db_version == new_version:
+                        print(
+                            f"[bold yellow]Warning: Database is already up to date (Version: {current_db_version}). Halting delta load.[/bold yellow]"
+                        )
+                        return  # Stop execution
+                    # Optional: Check if new version is older than db version
+                    if new_version < current_db_version:
+                        print(
+                            f"[bold red]Error: The source data version ({new_version}) is older than the database version ({current_db_version}). Halting.[/bold red]"
+                        )
+                        raise ValueError("Source data is older than database version.")
+                print(
+                    f"Proceeding with delta load from version '{current_db_version or 'None'}' to '{new_version}'."
+                )
+
+            print("[green]Extraction and version check complete.[/green]")
 
             # Step 2: Initialize Schema
             print("\n[bold]Step 2: Initializing database schema...[/bold]")
@@ -118,13 +160,12 @@ class PyLoadUniprotPipeline:
         Runs the Transformation and Loading steps for a single dataset.
         This method assumes the staging schema has already been initialized.
         """
-        settings = get_settings()
         print(f"\n[bold magenta]Processing dataset: {dataset}...[/bold magenta]")
 
         xml_filename = (
             f"uniprot_{'sprot' if dataset == 'swissprot' else 'trembl'}.xml.gz"
         )
-        source_xml_path = settings.data_dir / xml_filename
+        source_xml_path = self.settings.data_dir / xml_filename
         temp_dir = None
 
         if not source_xml_path.exists():
@@ -138,7 +179,7 @@ class PyLoadUniprotPipeline:
             temp_dir = Path(tempfile.mkdtemp(prefix=f"uniprot_{dataset}_"))
             print(f"    Intermediate files will be stored in: {temp_dir}")
             transformer.transform_xml_to_tsv(
-                source_xml_path, temp_dir, settings.profile
+                source_xml_path, temp_dir, self.settings.profile
             )
             print(f"  - Transformation complete for {dataset}.")
 

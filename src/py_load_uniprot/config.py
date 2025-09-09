@@ -29,6 +29,7 @@ class URLSettings(BaseModel):
     )
     release_notes_filename: str = "reldate.txt"
     checksums_filename: str = "MD5SUMS"
+    relnotes_url: str = "https://ftp.uniprot.org/pub/databases/uniprot/current_release/relnotes.txt"
 
 
 class Settings(BaseSettings):

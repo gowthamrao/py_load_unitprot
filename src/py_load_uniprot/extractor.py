@@ -249,9 +249,7 @@ class Extractor:
             raise
 
         # --- Get Entry Counts from relnotes.txt ---
-        relnotes_url = (
-            "https://ftp.uniprot.org/pub/databases/uniprot/current_release/relnotes.txt"
-        )
+        relnotes_url = self.settings.urls.relnotes_url
         print(f"Fetching statistics from {relnotes_url}")
         try:
             response = self.session.get(relnotes_url)

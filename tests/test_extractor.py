@@ -9,7 +9,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import requests
-from py_load_uniprot.config import Settings
+
+from py_load_uniprot.config import Settings, get_settings, initialize_settings
 from py_load_uniprot.extractor import Extractor
 
 
@@ -20,9 +21,16 @@ def temp_data_dir(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def settings(temp_data_dir: Path) -> Settings:
+def settings(temp_data_dir: Path):
     """A fixture to provide a Settings object for tests."""
-    return Settings(data_dir=temp_data_dir)
+    from py_load_uniprot import config
+
+    config._settings = None
+    initialize_settings()
+    s = get_settings()
+    s.data_dir = temp_data_dir
+    yield s
+    config._settings = None
 
 
 @pytest.fixture
@@ -38,8 +46,10 @@ def test_extractor_initialization(settings: Settings):
     assert settings.data_dir.exists()
 
 
-@patch('requests.Session.get')
-def test_download_file_success(mock_get: MagicMock, extractor: Extractor, settings: Settings):
+@patch("requests.Session.get")
+def test_download_file_success(
+    mock_get: MagicMock, extractor: Extractor, settings: Settings
+):
     """Test successful file download."""
     # --- Arrange ---
     filename = "test.xml.gz"
@@ -57,14 +67,14 @@ def test_download_file_success(mock_get: MagicMock, extractor: Extractor, settin
     downloaded_path = extractor.download_file(filename)
 
     # --- Assert ---
-    mock_get.assert_called_once_with(url, stream=True)
+    mock_get.assert_called_once_with(url, stream=True, headers={})
     mock_response.raise_for_status.assert_called_once()
 
     assert downloaded_path == settings.data_dir / filename
     assert downloaded_path.read_bytes() == file_content
 
 
-@patch('requests.Session.get')
+@patch("requests.Session.get")
 def test_download_file_http_error(mock_get: MagicMock, extractor: Extractor):
     """Test that download_file raises an exception on HTTP error."""
     # --- Arrange ---
@@ -75,7 +85,7 @@ def test_download_file_http_error(mock_get: MagicMock, extractor: Extractor):
         extractor.download_file("anyfile.gz")
 
 
-@patch('requests.Session.get')
+@patch("requests.Session.get")
 def test_fetch_checksums_success(mock_get: MagicMock, extractor: Extractor):
     """Test successfully fetching and parsing checksums."""
     # --- Arrange ---
@@ -140,8 +150,13 @@ def test_verify_checksum_not_found(extractor: Extractor, temp_data_dir: Path):
     assert extractor.verify_checksum(file_path) is True
 
 
-@patch('requests.Session.get')
-def test_get_release_info_success(mock_get: MagicMock, extractor: Extractor, settings: Settings):
+import datetime
+
+
+@patch("requests.Session.get")
+def test_get_release_info_success(
+    mock_get: MagicMock, extractor: Extractor, settings: Settings
+):
     """Test successfully parsing release info and persisting it."""
     # --- Arrange ---
     release_content = "Release 2025_09 of 08-Sep-2025"
@@ -154,18 +169,19 @@ def test_get_release_info_success(mock_get: MagicMock, extractor: Extractor, set
     info = extractor.get_release_info()
 
     # --- Assert ---
-    assert info['version'] == '2025_09'
-    assert info['date'] == '08-Sep-2025'
+    assert info["version"] == "2025_09"
+    assert info["date"] == datetime.date(2025, 9, 8)
 
     # Check that the metadata file was created and is correct
     metadata_path = settings.data_dir / "release_metadata.json"
     assert metadata_path.exists()
-    with open(metadata_path, 'r') as f:
+    with open(metadata_path, "r") as f:
         persisted_info = json.load(f)
-    assert persisted_info == info
+    assert persisted_info["version"] == "2025_09"
+    assert persisted_info["date"] == "2025-09-08"
 
 
-@patch('requests.Session.get')
+@patch("requests.Session.get")
 def test_get_release_info_parse_error(mock_get: MagicMock, extractor: Extractor):
     """Test that an error is raised if release info cannot be parsed."""
     # --- Arrange ---
@@ -175,5 +191,45 @@ def test_get_release_info_parse_error(mock_get: MagicMock, extractor: Extractor)
     mock_get.return_value = mock_response
 
     # --- Act & Assert ---
-    with pytest.raises(ValueError, match="Could not parse release version/date from reldate.txt"):
+    with pytest.raises(
+        ValueError, match="Could not parse release version/date from reldate.txt"
+    ):
         extractor.get_release_info()
+
+
+@patch("requests.Session.get")
+def test_download_file_resume_success(
+    mock_get: MagicMock, extractor: Extractor, settings: Settings
+):
+    """Test successful resumable file download."""
+    # --- Arrange ---
+    filename = "test_resume.xml.gz"
+    local_path = settings.data_dir / filename
+    initial_content = b"initial data"
+    resumed_content = b"resumed data"
+    downloaded_size = len(initial_content)
+
+    # Simulate existing partial file
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(local_path, "wb") as f:
+        f.write(initial_content)
+
+    # Mock the response for a range request
+    mock_response = MagicMock()
+    mock_response.status_code = 206  # Partial Content
+    mock_response.headers.get.return_value = str(len(resumed_content))
+    mock_response.iter_content.return_value = [resumed_content]
+    mock_get.return_value.__enter__.return_value = mock_response
+
+    # --- Act ---
+    extractor.download_file(filename)
+
+    # --- Assert ---
+    # Check that the request was made with the correct Range header
+    mock_get.assert_called_once()
+    args, kwargs = mock_get.call_args
+    assert "headers" in kwargs
+    assert kwargs["headers"]["Range"] == f"bytes={downloaded_size}-"
+
+    # Check that the file content is correct
+    assert local_path.read_bytes() == initial_content + resumed_content

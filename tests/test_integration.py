@@ -1,18 +1,24 @@
-import pytest
+import datetime
 import gzip
 from pathlib import Path
-import psycopg2
-import yaml
 
+import psycopg2
+import pytest
+import yaml
+from testcontainers.postgres import PostgresContainer
 from typer.testing import CliRunner
-from py_load_uniprot import transformer, extractor
+
+from py_load_uniprot import extractor, transformer
 from py_load_uniprot.cli import app
 from py_load_uniprot.config import Settings, initialize_settings
-from py_load_uniprot.db_manager import PostgresAdapter, postgres_connection, TABLE_LOAD_ORDER
-import datetime
-from testcontainers.postgres import PostgresContainer
+from py_load_uniprot.db_manager import (
+    TABLE_LOAD_ORDER,
+    PostgresAdapter,
+    postgres_connection,
+)
 
 runner = CliRunner()
+
 
 @pytest.fixture(scope="session")
 def postgres_container():
@@ -21,6 +27,7 @@ def postgres_container():
     """
     with PostgresContainer("postgres:15-alpine") as postgres:
         yield postgres
+
 
 @pytest.fixture(scope="session")
 def sample_xml_content():
@@ -63,6 +70,7 @@ def sample_xml_content():
 </uniprot>
 """
 
+
 @pytest.fixture
 def sample_xml_file(tmp_path: Path, sample_xml_content: str) -> Path:
     """Creates a gzipped sample XML file for testing."""
@@ -71,32 +79,29 @@ def sample_xml_file(tmp_path: Path, sample_xml_content: str) -> Path:
         f.write(sample_xml_content)
     return xml_path
 
+
 @pytest.fixture
-def db_adapter(postgres_container: PostgresContainer) -> PostgresAdapter:
+def db_adapter(postgres_container: PostgresContainer):
     """
     Provides a PostgresAdapter and initializes settings to use the test container.
     This fixture allows for component-level testing of the db_adapter.
     """
-    # Create a Settings object pointing to the test container
-    test_settings = Settings(
-        db={
-            "host": postgres_container.get_container_host_ip(),
-            "port": int(postgres_container.get_exposed_port(5432)),
-            "user": postgres_container.username,
-            "password": postgres_container.password,
-            "dbname": postgres_container.dbname,
-        }
-    )
-    # Manually initialize the settings for the scope of this test
+    from py_load_uniprot import config
+    from py_load_uniprot.config import get_settings, initialize_settings
+
+    config._settings = None
+    # Initialize settings with the test database connection details
     initialize_settings()
-    # We have to monkeypatch the global settings instance for this test
-    # This is less ideal than using the CLI but necessary for component testing.
-    import py_load_uniprot.config
-    py_load_uniprot.config._settings = test_settings
+    settings = get_settings()
+    settings.db.host = postgres_container.get_container_host_ip()
+    settings.db.port = int(postgres_container.get_exposed_port(5432))
+    settings.db.user = postgres_container.username
+    settings.db.password = postgres_container.password
+    settings.db.dbname = postgres_container.dbname
 
     adapter = PostgresAdapter(
         staging_schema="integration_test_staging",
-        production_schema="integration_test_public"
+        production_schema="integration_test_public",
     )
     yield adapter
     # Cleanup: drop the production schema after the test
@@ -108,6 +113,8 @@ def db_adapter(postgres_container: PostgresContainer) -> PostgresAdapter:
         print("Test schema torn down successfully.")
     except psycopg2.Error as e:
         print(f"Error during teardown: {e}")
+    finally:
+        config._settings = None
 
 
 # V2: P12345 is modified, P67890 is deleted, A0A0A0 is new
@@ -144,6 +151,7 @@ SAMPLE_XML_V2_CONTENT = """<?xml version="1.0" encoding="UTF-8"?>
 </uniprot>
 """
 
+
 @pytest.fixture
 def sample_xml_v2_file(tmp_path: Path) -> Path:
     """Creates a gzipped sample V2 XML file for delta load testing."""
@@ -153,7 +161,9 @@ def sample_xml_v2_file(tmp_path: Path) -> Path:
     return xml_path
 
 
-def test_full_etl_pipeline_components(sample_xml_file: Path, db_adapter: PostgresAdapter, tmp_path: Path):
+def test_full_etl_pipeline_components(
+    sample_xml_file: Path, db_adapter: PostgresAdapter, tmp_path: Path
+):
     """
     Tests the database adapter components: Transform -> Initialize -> Load -> Finalize -> Metadata.
     This test requires a running PostgreSQL instance and uses the db_adapter fixture.
@@ -161,7 +171,7 @@ def test_full_etl_pipeline_components(sample_xml_file: Path, db_adapter: Postgre
     # Arrange
     output_dir = tmp_path / "transformed_output"
     release_info = {
-        "release_version": "2025_TEST",
+        "version": "2025_TEST",
         "release_date": datetime.date(2025, 1, 31),
         "swissprot_entry_count": 1,
         "trembl_entry_count": 1,
@@ -172,7 +182,7 @@ def test_full_etl_pipeline_components(sample_xml_file: Path, db_adapter: Postgre
     transformer.transform_xml_to_tsv(sample_xml_file, output_dir, profile="full")
 
     # 2. Initialize
-    db_adapter.initialize_schema(mode='full')
+    db_adapter.initialize_schema(mode="full")
 
     # 3. Load
     for table_name in TABLE_LOAD_ORDER:
@@ -181,28 +191,37 @@ def test_full_etl_pipeline_components(sample_xml_file: Path, db_adapter: Postgre
             db_adapter.bulk_load_intermediate(file_path, table_name)
 
     # 4. Finalize
-    db_adapter.finalize_load(mode='full')
+    db_adapter.finalize_load(mode="full")
 
     # 5. Update Metadata
     db_adapter.update_metadata(release_info)
 
-
     # --- Assert ---
     with postgres_connection() as conn, conn.cursor() as cur:
         # Assert schema and table structure
-        cur.execute("SELECT 1 FROM pg_namespace WHERE nspname = %s", (db_adapter.production_schema,))
+        cur.execute(
+            "SELECT 1 FROM pg_namespace WHERE nspname = %s",
+            (db_adapter.production_schema,),
+        )
         assert cur.fetchone() is not None, "Production schema should exist"
-        cur.execute("SELECT 1 FROM pg_namespace WHERE nspname = %s", (db_adapter.staging_schema,))
+        cur.execute(
+            "SELECT 1 FROM pg_namespace WHERE nspname = %s",
+            (db_adapter.staging_schema,),
+        )
         assert cur.fetchone() is None, "Staging schema should have been renamed"
 
         # Assert data integrity
         cur.execute(f"SELECT COUNT(*) FROM {db_adapter.production_schema}.proteins")
         assert cur.fetchone()[0] == 2
-        cur.execute(f"SELECT uniprot_id FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'")
-        assert cur.fetchone()[0] == 'TEST1_HUMAN'
+        cur.execute(
+            f"SELECT uniprot_id FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'"
+        )
+        assert cur.fetchone()[0] == "TEST1_HUMAN"
 
         # Assert Metadata
-        cur.execute(f"SELECT release_version, release_date FROM {db_adapter.production_schema}.py_load_uniprot_metadata")
+        cur.execute(
+            f"SELECT version, release_date FROM {db_adapter.production_schema}.py_load_uniprot_metadata"
+        )
         metadata_row = cur.fetchone()
         assert metadata_row is not None, "Metadata row should exist"
         assert metadata_row[0] == "2025_TEST"
@@ -225,14 +244,20 @@ def sample_xml_with_evidence_content():
 </uniprot>
 """
 
+
 @pytest.fixture
-def sample_xml_with_evidence_file(tmp_path: Path, sample_xml_with_evidence_content: str) -> Path:
+def sample_xml_with_evidence_file(
+    tmp_path: Path, sample_xml_with_evidence_content: str
+) -> Path:
     xml_path = tmp_path / "sample_with_evidence.xml.gz"
     with gzip.open(xml_path, "wt", encoding="utf-8") as f:
         f.write(sample_xml_with_evidence_content)
     return xml_path
 
-def test_evidence_data_is_transformed_and_loaded(sample_xml_with_evidence_file: Path, db_adapter: PostgresAdapter, tmp_path: Path):
+
+def test_evidence_data_is_transformed_and_loaded(
+    sample_xml_with_evidence_file: Path, db_adapter: PostgresAdapter, tmp_path: Path
+):
     """
     Tests that the transformer correctly parses evidence tags and the db_adapter
     correctly loads this data into the JSONB column.
@@ -243,19 +268,23 @@ def test_evidence_data_is_transformed_and_loaded(sample_xml_with_evidence_file: 
 
     # Act
     # 1. Transform the specific XML with evidence tags
-    transformer.transform_xml_to_tsv(sample_xml_with_evidence_file, output_dir, profile="full")
+    transformer.transform_xml_to_tsv(
+        sample_xml_with_evidence_file, output_dir, profile="full"
+    )
 
     # 2. Load it into the database
-    db_adapter.initialize_schema(mode='full')
+    db_adapter.initialize_schema(mode="full")
     for table_name in TABLE_LOAD_ORDER:
         file_path = output_dir / f"{table_name}.tsv.gz"
         if file_path.exists():
             db_adapter.bulk_load_intermediate(file_path, table_name)
-    db_adapter.finalize_load(mode='full')
+    db_adapter.finalize_load(mode="full")
 
     # Assert
     with postgres_connection() as conn, conn.cursor() as cur:
-        cur.execute(f"SELECT evidence_data FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'")
+        cur.execute(
+            f"SELECT evidence_data FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'"
+        )
         evidence_row = cur.fetchone()
         assert evidence_row is not None, "Protein P12345 should be loaded"
 
@@ -268,10 +297,18 @@ def test_evidence_data_is_transformed_and_loaded(sample_xml_with_evidence_file: 
         assert evidence_item["tag"] == "evidence"
         assert evidence_item["attributes"]["key"] == "1"
         assert evidence_item["attributes"]["type"] == "ECO:0000269"
-        assert evidence_item["children"][0]['children'][0]["attributes"]["type"] == "PubMed"
+        assert (
+            evidence_item["children"][0]["children"][0]["attributes"]["type"]
+            == "PubMed"
+        )
 
 
-def test_delta_load_pipeline(sample_xml_file: Path, sample_xml_v2_file: Path, db_adapter: PostgresAdapter, tmp_path: Path):
+def test_delta_load_pipeline(
+    sample_xml_file: Path,
+    sample_xml_v2_file: Path,
+    db_adapter: PostgresAdapter,
+    tmp_path: Path,
+):
     """
     Tests the delta load functionality by performing a full load, then a delta load,
     and verifying the state of the database after each step.
@@ -283,34 +320,52 @@ def test_delta_load_pipeline(sample_xml_file: Path, sample_xml_v2_file: Path, db
     # --- Act 1: Initial Full Load (V1) ---
     print("--- Running Initial Full Load (V1) ---")
     transformer.transform_xml_to_tsv(sample_xml_file, output_dir_v1, profile="full")
-    db_adapter.initialize_schema(mode='full')
+    db_adapter.initialize_schema(mode="full")
     for table_name in TABLE_LOAD_ORDER:
         file_path = output_dir_v1 / f"{table_name}.tsv.gz"
         if file_path.exists():
             db_adapter.bulk_load_intermediate(file_path, table_name)
-    db_adapter.finalize_load(mode='full')
-    db_adapter.update_metadata({"release_version": "V1_TEST", "release_date": datetime.date(2024, 1, 1), "swissprot_entry_count": 1, "trembl_entry_count": 1})
+    db_adapter.finalize_load(mode="full")
+    db_adapter.update_metadata(
+        {
+            "version": "V1_TEST",
+            "release_date": datetime.date(2024, 1, 1),
+            "swissprot_entry_count": 1,
+            "trembl_entry_count": 1,
+        }
+    )
     print("--- Full Load (V1) Complete ---")
 
     # --- Assert 1: State after Full Load ---
     with postgres_connection() as conn, conn.cursor() as cur:
         cur.execute(f"SELECT COUNT(*) FROM {db_adapter.production_schema}.proteins")
         assert cur.fetchone()[0] == 2
-        cur.execute(f"SELECT uniprot_id FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'")
-        assert cur.fetchone()[0] == 'TEST1_HUMAN'
-        cur.execute(f"SELECT 1 FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P67890'")
+        cur.execute(
+            f"SELECT uniprot_id FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'"
+        )
+        assert cur.fetchone()[0] == "TEST1_HUMAN"
+        cur.execute(
+            f"SELECT 1 FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P67890'"
+        )
         assert cur.fetchone() is not None
 
     # --- Act 2: Delta Load (V2) ---
     print("--- Running Delta Load (V2) ---")
     transformer.transform_xml_to_tsv(sample_xml_v2_file, output_dir_v2, profile="full")
-    db_adapter.initialize_schema(mode='delta') # Re-initialize STAGING schema
+    db_adapter.initialize_schema(mode="delta")  # Re-initialize STAGING schema
     for table_name in TABLE_LOAD_ORDER:
         file_path = output_dir_v2 / f"{table_name}.tsv.gz"
         if file_path.exists():
             db_adapter.bulk_load_intermediate(file_path, table_name)
-    db_adapter.finalize_load(mode='delta')
-    db_adapter.update_metadata({"release_version": "V2_TEST", "release_date": datetime.date(2025, 1, 1), "swissprot_entry_count": 2, "trembl_entry_count": 0})
+    db_adapter.finalize_load(mode="delta")
+    db_adapter.update_metadata(
+        {
+            "version": "V2_TEST",
+            "release_date": datetime.date(2025, 1, 1),
+            "swissprot_entry_count": 2,
+            "trembl_entry_count": 0,
+        }
+    )
     print("--- Delta Load (V2) Complete ---")
 
     # --- Assert 2: State after Delta Load ---
@@ -320,25 +375,41 @@ def test_delta_load_pipeline(sample_xml_file: Path, sample_xml_v2_file: Path, db
         assert cur.fetchone()[0] == 2, "Total protein count should be 2 after delta."
 
         # Check that P12345 was updated
-        cur.execute(f"SELECT uniprot_id, sequence_length FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'")
+        cur.execute(
+            f"SELECT uniprot_id, sequence_length FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'"
+        )
         updated_protein = cur.fetchone()
-        assert updated_protein[0] == 'TEST1_HUMAN_UPDATED', "Protein P12345 should have been updated."
-        assert updated_protein[1] == 11, "Sequence length for P12345 should have been updated."
+        assert (
+            updated_protein[0] == "TEST1_HUMAN_UPDATED"
+        ), "Protein P12345 should have been updated."
+        assert (
+            updated_protein[1] == 11
+        ), "Sequence length for P12345 should have been updated."
 
         # Check that P67890 was deleted
-        cur.execute(f"SELECT 1 FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P67890'")
+        cur.execute(
+            f"SELECT 1 FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P67890'"
+        )
         assert cur.fetchone() is None, "Protein P67890 should have been deleted."
 
         # Check that A0A0A0 was inserted
-        cur.execute(f"SELECT uniprot_id FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'A0A0A0'")
-        assert cur.fetchone()[0] == 'TEST3_NEW', "New protein A0A0A0 should have been inserted."
+        cur.execute(
+            f"SELECT uniprot_id FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'A0A0A0'"
+        )
+        assert (
+            cur.fetchone()[0] == "TEST3_NEW"
+        ), "New protein A0A0A0 should have been inserted."
 
         # Check that metadata was updated to V2
-        cur.execute(f"SELECT release_version FROM {db_adapter.production_schema}.py_load_uniprot_metadata")
-        assert cur.fetchone()[0] == 'V2_TEST'
+        cur.execute(
+            f"SELECT version FROM {db_adapter.production_schema}.py_load_uniprot_metadata"
+        )
+        assert cur.fetchone()[0] == "V2_TEST"
 
 
-def test_status_command_reporting(db_adapter: PostgresAdapter, sample_xml_file: Path, tmp_path: Path):
+def test_status_command_reporting(
+    db_adapter: PostgresAdapter, sample_xml_file: Path, tmp_path: Path
+):
     """
     Tests that the get_current_release_version function (used by the status command)
     reports the correct status before and after a load.
@@ -350,91 +421,92 @@ def test_status_command_reporting(db_adapter: PostgresAdapter, sample_xml_file: 
     # 2. After a full load, it should return the correct version
     output_dir = tmp_path / "transformed_output"
     release_info = {
-        "release_version": "2025_STATUS_TEST",
+        "version": "2025_STATUS_TEST",
         "release_date": datetime.date(2025, 2, 1),
         "swissprot_entry_count": 1,
         "trembl_entry_count": 1,
     }
     transformer.transform_xml_to_tsv(sample_xml_file, output_dir, profile="full")
-    db_adapter.initialize_schema(mode='full')
+    db_adapter.initialize_schema(mode="full")
     for table_name in TABLE_LOAD_ORDER:
         file_path = output_dir / f"{table_name}.tsv.gz"
         if file_path.exists():
             db_adapter.bulk_load_intermediate(file_path, table_name)
-    db_adapter.finalize_load(mode='full')
+    db_adapter.finalize_load(mode="full")
     db_adapter.update_metadata(release_info)
 
     # Now, check the version again
     version = db_adapter.get_current_release_version()
-    assert version == "2025_STATUS_TEST", "get_current_release_version should return the loaded version"
+    assert (
+        version == "2025_STATUS_TEST"
+    ), "get_current_release_version should return the loaded version"
 
 
-def test_cli_full_load_with_yaml_config(postgres_container: PostgresContainer, sample_xml_file: Path, tmp_path: Path, mocker):
+def test_cli_full_load_with_env_vars(
+    postgres_container: PostgresContainer, sample_xml_file: Path, tmp_path: Path, mocker
+):
     """
-    Tests the full end-to-end pipeline via the CLI, configured with a YAML file.
+    Tests the full end-to-end pipeline via the CLI, configured with environment variables.
     This is the most comprehensive integration test.
     """
     # --- Arrange ---
     # 1. Create a temporary data directory and place the sample XML file in it
     data_dir = tmp_path / "test_data"
     data_dir.mkdir()
-    test_sprot_path = data_dir / "uniprot_swissprot.xml.gz"
-    with gzip.open(sample_xml_file, 'rb') as f_in, gzip.open(test_sprot_path, 'wb') as f_out:
+    test_sprot_path = data_dir / "uniprot_sprot.xml.gz"
+    with (
+        gzip.open(sample_xml_file, "rb") as f_in,
+        gzip.open(test_sprot_path, "wb") as f_out,
+    ):
         f_out.writelines(f_in)
 
-    # 2. Create a temporary YAML config file pointing to the test container
-    db_url = postgres_container.get_connection_url()
-    config_data = {
-        "data_dir": str(data_dir),
-        "db": {
-            "host": postgres_container.get_container_host_ip(),
-            "port": int(postgres_container.get_exposed_port(5432)),
-            "user": postgres_container.username,
-            "password": postgres_container.password,
-            "dbname": postgres_container.dbname,
-        }
+    # 2. Set up environment variables for the test
+    env = {
+        "PY_LOAD_UNIPROT_DATA_DIR": str(data_dir),
+        "PY_LOAD_UNIPROT_DB__HOST": postgres_container.get_container_host_ip(),
+        "PY_LOAD_UNIPROT_DB__PORT": str(postgres_container.get_exposed_port(5432)),
+        "PY_LOAD_UNIPROT_DB__USER": postgres_container.username,
+        "PY_LOAD_UNIPROT_DB__PASSWORD": postgres_container.password,
+        "PY_LOAD_UNIPROT_DB__DBNAME": postgres_container.dbname,
     }
-    config_path = tmp_path / "test_config.yaml"
-    with open(config_path, "w") as f:
-        yaml.dump(config_data, f)
 
     # 3. Mock the extractor to prevent network calls
     mock_release_info = {
-        "release_version": "CLI_YAML_TEST",
+        "version": "CLI_ENV_TEST",
         "release_date": datetime.date(2025, 4, 1),
         "swissprot_entry_count": 2,
         "trembl_entry_count": 0,
     }
-    # Correctly mock the method on the Extractor class instance
-    mocker.patch.object(extractor.Extractor, 'get_release_info', return_value=mock_release_info)
+    mocker.patch.object(
+        extractor.Extractor, "get_release_info", return_value=mock_release_info
+    )
 
     # --- Act ---
     # Run the 'run' command via the Typer test runner
     result = runner.invoke(
         app,
-        [
-            "--config", str(config_path),
-            "run",
-            "--dataset", "swissprot",
-            "--mode", "full",
-        ],
-        catch_exceptions=False # Set to False to see full traceback on error
+        ["run", "--dataset", "swissprot", "--mode", "full"],
+        env=env,
+        catch_exceptions=False,
     )
 
     # --- Assert ---
     # 1. Check CLI output
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.stdout
     assert "ETL pipeline completed successfully!" in result.stdout
 
     # 2. Check database state
-    prod_schema = "uniprot_public" # Default production schema
-    with psycopg2.connect(
-        host=postgres_container.get_container_host_ip(),
-        port=int(postgres_container.get_exposed_port(5432)),
-        user=postgres_container.username,
-        password=postgres_container.password,
-        dbname=postgres_container.dbname,
-    ) as conn, conn.cursor() as cur:
+    prod_schema = "uniprot_public"  # Default production schema
+    with (
+        psycopg2.connect(
+            host=postgres_container.get_container_host_ip(),
+            port=int(postgres_container.get_exposed_port(5432)),
+            user=postgres_container.username,
+            password=postgres_container.password,
+            dbname=postgres_container.dbname,
+        ) as conn,
+        conn.cursor() as cur,
+    ):
         # Check that the production schema exists and staging is gone
         cur.execute("SELECT 1 FROM pg_namespace WHERE nspname = %s", (prod_schema,))
         assert cur.fetchone() is not None, "Production schema should exist"
@@ -446,11 +518,15 @@ def test_cli_full_load_with_yaml_config(postgres_container: PostgresContainer, s
         assert cur.fetchone()[0] == 2
 
         # Check that metadata was loaded
-        cur.execute(f"SELECT release_version FROM {prod_schema}.py_load_uniprot_metadata")
-        assert cur.fetchone()[0] == "CLI_YAML_TEST"
+        cur.execute(
+            f"SELECT version FROM {prod_schema}.py_load_uniprot_metadata"
+        )
+        assert cur.fetchone()[0] == "CLI_ENV_TEST"
 
         # Check that load history was populated correctly
-        cur.execute(f"SELECT status, mode, dataset FROM {prod_schema}.load_history ORDER BY start_time ASC")
+        cur.execute(
+            f"SELECT status, mode, dataset FROM {prod_schema}.load_history ORDER BY start_time ASC"
+        )
         history_rows = cur.fetchall()
         assert len(history_rows) == 1, "Should be one history record for the run"
 

@@ -1,18 +1,20 @@
 """
 This module contains the main ETL pipeline orchestration logic.
 """
-import tempfile
+
+import datetime
 import shutil
+import tempfile
+import traceback
+import uuid
 from pathlib import Path
+
 from rich import print
 from rich.markup import escape
-import uuid
-import traceback
-import datetime
 
 from py_load_uniprot import extractor, transformer
 from py_load_uniprot.config import get_settings
-from py_load_uniprot.db_manager import PostgresAdapter, TABLE_LOAD_ORDER
+from py_load_uniprot.db_manager import TABLE_LOAD_ORDER, PostgresAdapter
 
 
 class PyLoadUniprotPipeline:
@@ -20,14 +22,15 @@ class PyLoadUniprotPipeline:
     Orchestrates the entire UniProt ETL process, from data extraction to database loading.
     This class is designed to be used programmatically, for example in workflow managers.
     """
-    def __init__(self):
+
+    def __init__(self) -> None:
         """
         Initializes the pipeline and the database adapter.
         """
         print("[bold blue]Pipeline initialized.[/bold blue]")
         self.db_adapter = PostgresAdapter()
 
-    def run(self, dataset: str, mode: str):
+    def run(self, dataset: str, mode: str) -> None:
         """
         Executes the full ETL pipeline for a specified dataset(s) and load mode.
         Includes comprehensive status logging to the `load_history` table.
@@ -46,14 +49,20 @@ class PyLoadUniprotPipeline:
         print(f"Dataset: [cyan]{dataset}[/cyan], Mode: [cyan]{mode}[/cyan]")
 
         try:
-            if mode not in ['full', 'delta']:
-                raise ValueError(f"Load mode '{mode}' is not valid. Choose 'full' or 'delta'.")
+            if mode not in ["full", "delta"]:
+                raise ValueError(
+                    f"Load mode '{mode}' is not valid. Choose 'full' or 'delta'."
+                )
 
-            valid_datasets = ['swissprot', 'trembl', 'all']
+            valid_datasets = ["swissprot", "trembl", "all"]
             if dataset not in valid_datasets:
-                raise ValueError(f"Dataset '{dataset}' is not valid. Choose from {valid_datasets}.")
+                raise ValueError(
+                    f"Dataset '{dataset}' is not valid. Choose from {valid_datasets}."
+                )
 
-            datasets_to_process = ['swissprot', 'trembl'] if dataset == 'all' else [dataset]
+            datasets_to_process = (
+                ["swissprot", "trembl"] if dataset == "all" else [dataset]
+            )
 
             # Step 1: Extraction
             print("\n[bold]Step 1: Running data extraction...[/bold]")
@@ -82,7 +91,9 @@ class PyLoadUniprotPipeline:
 
             # If we reach here, the pipeline was successful
             end_time = datetime.datetime.now()
-            self.db_adapter.log_run(run_id, mode, dataset, "COMPLETED", start_time, end_time)
+            self.db_adapter.log_run(
+                run_id, mode, dataset, "COMPLETED", start_time, end_time
+            )
             print("\n[bold green]ETL pipeline completed successfully![/bold green]")
 
         except Exception as e:
@@ -91,10 +102,18 @@ class PyLoadUniprotPipeline:
             error_msg = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
             print(f"[bold red]\nETL pipeline failed: {escape(error_msg)}[/bold red]")
             # Log the failure and then re-raise the exception
-            self.db_adapter.log_run(run_id, mode, dataset, "FAILED", start_time, end_time, error_message=error_msg)
+            self.db_adapter.log_run(
+                run_id,
+                mode,
+                dataset,
+                "FAILED",
+                start_time,
+                end_time,
+                error_message=error_msg,
+            )
             raise
 
-    def _transform_and_load_single_dataset(self, dataset: str):
+    def _transform_and_load_single_dataset(self, dataset: str) -> None:
         """
         Runs the Transformation and Loading steps for a single dataset.
         This method assumes the staging schema has already been initialized.
@@ -102,19 +121,25 @@ class PyLoadUniprotPipeline:
         settings = get_settings()
         print(f"\n[bold magenta]Processing dataset: {dataset}...[/bold magenta]")
 
-        xml_filename = f"uniprot_{'sprot' if dataset == 'swissprot' else 'trembl'}.xml.gz"
+        xml_filename = (
+            f"uniprot_{'sprot' if dataset == 'swissprot' else 'trembl'}.xml.gz"
+        )
         source_xml_path = settings.data_dir / xml_filename
         temp_dir = None
 
         if not source_xml_path.exists():
-            raise FileNotFoundError(f"Source file not found for dataset '{dataset}': {source_xml_path}")
+            raise FileNotFoundError(
+                f"Source file not found for dataset '{dataset}': {source_xml_path}"
+            )
 
         try:
             # Transformation (XML -> TSV.gz)
             print(f"  - Running data transformation for {dataset}...")
             temp_dir = Path(tempfile.mkdtemp(prefix=f"uniprot_{dataset}_"))
             print(f"    Intermediate files will be stored in: {temp_dir}")
-            transformer.transform_xml_to_tsv(source_xml_path, temp_dir, settings.profile)
+            transformer.transform_xml_to_tsv(
+                source_xml_path, temp_dir, settings.profile
+            )
             print(f"  - Transformation complete for {dataset}.")
 
             # Database Load into Staging
@@ -125,7 +150,9 @@ class PyLoadUniprotPipeline:
                     print(f"    Loading {table_name}...")
                     self.db_adapter.bulk_load_intermediate(file_path, table_name)
                 else:
-                    print(f"    [yellow]Warning: No data file for '{table_name}'. Skipping.[/yellow]")
+                    print(
+                        f"    [yellow]Warning: No data file for '{table_name}'. Skipping.[/yellow]"
+                    )
             print(f"  - Staging load complete for {dataset}.")
 
         finally:

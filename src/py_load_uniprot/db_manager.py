@@ -1,22 +1,32 @@
 import gzip
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
+from typing import Any, Iterator
+
 import psycopg2
+from psycopg2.extensions import connection, cursor
 from rich import print
-import datetime
 
 from py_load_uniprot.config import get_settings
 from py_load_uniprot.transformer import TABLE_HEADERS
 
 TABLE_LOAD_ORDER = [
-    'taxonomy', 'proteins', 'sequences', 'accessions', 'genes',
-    'keywords', 'protein_to_go', 'protein_to_taxonomy'
+    "taxonomy",
+    "proteins",
+    "sequences",
+    "accessions",
+    "genes",
+    "keywords",
+    "protein_to_go",
+    "protein_to_taxonomy",
 ]
-TABLES_WITH_UNIQUE_CONSTRAINTS = {'taxonomy': 'ncbi_taxid'}
+TABLES_WITH_UNIQUE_CONSTRAINTS: dict[str, str] = {"taxonomy": "ncbi_taxid"}
+
 
 @contextmanager
-def postgres_connection():
+def postgres_connection() -> Iterator[connection]:
     settings = get_settings()
     conn = None
     try:
@@ -28,6 +38,7 @@ def postgres_connection():
     finally:
         if conn:
             conn.close()
+
 
 class DatabaseAdapter(ABC):
     @abstractmethod
@@ -56,7 +67,7 @@ class DatabaseAdapter(ABC):
         pass
 
     @abstractmethod
-    def update_metadata(self, release_info: dict) -> None:
+    def update_metadata(self, release_info: dict[str, Any]) -> None:
         """Updates the internal metadata tables."""
         pass
 
@@ -66,15 +77,31 @@ class DatabaseAdapter(ABC):
         pass
 
     @abstractmethod
-    def log_run(self, run_id: str, mode: str, dataset: str, status: str, start_time: datetime, end_time: datetime, error_message: str | None = None) -> None:
+    def log_run(
+        self,
+        run_id: str,
+        mode: str,
+        dataset: str,
+        status: str,
+        start_time: datetime,
+        end_time: datetime,
+        error_message: str | None = None,
+    ) -> None:
         """Logs a pipeline run to the history table."""
         pass
 
+
 class PostgresAdapter(DatabaseAdapter):
-    def __init__(self, staging_schema: str = "uniprot_staging", production_schema: str = "uniprot_public"):
+    def __init__(
+        self,
+        staging_schema: str = "uniprot_staging",
+        production_schema: str = "uniprot_public",
+    ) -> None:
         self.staging_schema = staging_schema
         self.production_schema = production_schema
-        print(f"PostgresAdapter initialized. Staging: [cyan]{self.staging_schema}[/cyan], Production: [cyan]{self.production_schema}[/cyan]")
+        print(
+            f"PostgresAdapter initialized. Staging: [cyan]{self.staging_schema}[/cyan], Production: [cyan]{self.production_schema}[/cyan]"
+        )
 
     def check_connection(self) -> None:
         """Establishes a connection and performs a simple query."""
@@ -119,7 +146,9 @@ class PostgresAdapter(DatabaseAdapter):
         """
 
     def initialize_schema(self, mode: str) -> None:
-        print(f"Initializing database schema in [cyan]'{self.staging_schema}'[/cyan] for mode '{mode}'...")
+        print(
+            f"Initializing database schema in [cyan]'{self.staging_schema}'[/cyan] for mode '{mode}'..."
+        )
         with postgres_connection() as conn, conn.cursor() as cur:
             # In both full and delta modes, we start with a clean staging schema
             cur.execute(f"DROP SCHEMA IF EXISTS {self.staging_schema} CASCADE;")
@@ -127,7 +156,7 @@ class PostgresAdapter(DatabaseAdapter):
             conn.commit()
         print("[green]Staging schema initialized successfully.[/green]")
 
-    def bulk_load_intermediate(self, file_path: Path, table_name: str):
+    def bulk_load_intermediate(self, file_path: Path, table_name: str) -> None:
         """
         Loads a single intermediate TSV.gz file into a table in the staging schema.
         This implementation dispatches to a direct COPY or a safe UPSERT based
@@ -139,33 +168,47 @@ class PostgresAdapter(DatabaseAdapter):
         else:
             self._direct_copy_load(file_path, table_name)
 
-    def _direct_copy_load(self, file_path: Path, table_name: str):
+    def _direct_copy_load(self, file_path: Path, table_name: str) -> None:
         target = f"{self.staging_schema}.{table_name}"
         print(f"Performing direct COPY for '{table_name}'...")
-        with postgres_connection() as conn, conn.cursor() as cur, gzip.open(file_path, 'rt', encoding='utf-8') as f:
-            header = f.readline().strip().split('\t')
-            cur.copy_expert(f"COPY {target} ({','.join(header)}) FROM STDIN WITH (FORMAT csv, DELIMITER E'\\t', HEADER false)", f)
+        with (
+            postgres_connection() as conn,
+            conn.cursor() as cur,
+            gzip.open(file_path, "rt", encoding="utf-8") as f,
+        ):
+            header = f.readline().strip().split("\t")
+            cur.copy_expert(
+                f"COPY {target} ({','.join(header)}) FROM STDIN WITH (FORMAT csv, DELIMITER E'\\t', HEADER false)",
+                f,
+            )
             conn.commit()
 
-    def _safe_upsert_load(self, file_path: Path, table_name: str, unique_key: str):
+    def _safe_upsert_load(self, file_path: Path, table_name: str, unique_key: str) -> None:
         target = f"{self.staging_schema}.{table_name}"
         temp_table = f"temp_{table_name}"
         print(f"Performing safe upsert for '{table_name}'...")
         with postgres_connection() as conn, conn.cursor() as cur:
-            cur.execute(f"CREATE TEMP TABLE {temp_table} ON COMMIT DROP AS TABLE {target} WITH NO DATA;")
-            with gzip.open(file_path, 'rt', encoding='utf-8') as f:
-                header = f.readline().strip().split('\t')
-                cur.copy_expert(f"COPY {temp_table} ({','.join(header)}) FROM STDIN WITH (FORMAT csv, DELIMITER E'\\t', HEADER false)", f)
+            cur.execute(
+                f"CREATE TEMP TABLE {temp_table} ON COMMIT DROP AS TABLE {target} WITH NO DATA;"
+            )
+            with gzip.open(file_path, "rt", encoding="utf-8") as f:
+                header = f.readline().strip().split("\t")
+                cur.copy_expert(
+                    f"COPY {temp_table} ({','.join(header)}) FROM STDIN WITH (FORMAT csv, DELIMITER E'\\t', HEADER false)",
+                    f,
+                )
             cols = TABLE_HEADERS[table_name]
-            cur.execute(f"INSERT INTO {target} ({', '.join(cols)}) SELECT * FROM {temp_table} ON CONFLICT ({unique_key}) DO NOTHING;")
+            cur.execute(
+                f"INSERT INTO {target} ({', '.join(cols)}) SELECT * FROM {temp_table} ON CONFLICT ({unique_key}) DO NOTHING;"
+            )
             conn.commit()
 
-    def _create_indexes(self, cur):
+    def _create_indexes(self, cur: cursor) -> None:
         print("Creating indexes on staging schema...")
         cur.execute(self._get_indexes_ddl())
         print("[green]Indexes created successfully.[/green]")
 
-    def _analyze_schema(self, cur):
+    def _analyze_schema(self, cur: cursor) -> None:
         print(f"Running ANALYZE on schema '{self.staging_schema}'...")
         cur.execute(f"ANALYZE {self.staging_schema}.proteins;")
         cur.execute(f"ANALYZE {self.staging_schema}.taxonomy;")
@@ -173,56 +216,78 @@ class PostgresAdapter(DatabaseAdapter):
         print("[green]ANALYZE complete.[/green]")
 
     def finalize_load(self, mode: str) -> None:
-        if mode == 'full':
+        if mode == "full":
             self._finalize_full_load()
-        elif mode == 'delta':
+        elif mode == "delta":
             self._finalize_delta_load()
         else:
-            print(f"[bold red]Unsupported load mode '{mode}' in finalize_load.[/bold red]")
+            print(
+                f"[bold red]Unsupported load mode '{mode}' in finalize_load.[/bold red]"
+            )
 
     def _finalize_full_load(self) -> None:
-        print("[bold blue]Finalizing full load: creating indexes and performing schema swap...[/bold blue]")
+        print(
+            "[bold blue]Finalizing full load: creating indexes and performing schema swap...[/bold blue]"
+        )
         with postgres_connection() as conn, conn.cursor() as cur:
             self._create_indexes(cur)
             self._analyze_schema(cur)
 
             # Perform the atomic swap
             print("Performing atomic schema swap...")
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             archive_schema_name = f"{self.production_schema}_old_{timestamp}"
 
-            cur.execute("SELECT 1 FROM pg_namespace WHERE nspname = %s", (self.production_schema,))
+            cur.execute(
+                "SELECT 1 FROM pg_namespace WHERE nspname = %s",
+                (self.production_schema,),
+            )
             if cur.fetchone():
-                print(f"Archiving existing schema '{self.production_schema}' to '{archive_schema_name}'...")
-                cur.execute(f"ALTER SCHEMA {self.production_schema} RENAME TO {archive_schema_name};")
+                print(
+                    f"Archiving existing schema '{self.production_schema}' to '{archive_schema_name}'..."
+                )
+                cur.execute(
+                    f"ALTER SCHEMA {self.production_schema} RENAME TO {archive_schema_name};"
+                )
 
-            print(f"Activating new schema by renaming '{self.staging_schema}' to '{self.production_schema}'...")
-            cur.execute(f"ALTER SCHEMA {self.staging_schema} RENAME TO {self.production_schema};")
+            print(
+                f"Activating new schema by renaming '{self.staging_schema}' to '{self.production_schema}'..."
+            )
+            cur.execute(
+                f"ALTER SCHEMA {self.staging_schema} RENAME TO {self.production_schema};"
+            )
             # Now that the new production schema is live, create the metadata tables in it
             self._create_metadata_tables(cur)
             conn.commit()
-        print(f"[bold green]Schema swap complete. '{self.production_schema}' is now live.[/bold green]")
+        print(
+            f"[bold green]Schema swap complete. '{self.production_schema}' is now live.[/bold green]"
+        )
 
     def _finalize_delta_load(self) -> None:
-        print("[bold blue]Finalizing delta load: merging staging into production...[/bold blue]")
+        print(
+            "[bold blue]Finalizing delta load: merging staging into production...[/bold blue]"
+        )
         with postgres_connection() as conn, conn.cursor() as cur:
             self._create_production_schema_if_not_exists(cur)
             self._execute_delta_update(cur)
             conn.commit()
         print("[bold green]Delta load complete.[/bold green]")
 
-    def _create_metadata_tables(self, cur) -> None:
+    def _create_metadata_tables(self, cur: cursor) -> None:
         """Creates the metadata tables in the production schema."""
-        cur.execute(f"""
+        cur.execute(
+            f"""
             CREATE TABLE IF NOT EXISTS {self.production_schema}.py_load_uniprot_metadata (
-                release_version VARCHAR(255) PRIMARY KEY,
+                version VARCHAR(255) PRIMARY KEY,
                 release_date DATE,
                 load_timestamp TIMESTAMPTZ DEFAULT NOW(),
                 swissprot_entry_count INTEGER,
                 trembl_entry_count INTEGER
             );
-        """)
-        cur.execute(f"""
+        """
+        )
+        cur.execute(
+            f"""
             CREATE TABLE IF NOT EXISTS {self.production_schema}.load_history (
                 id SERIAL PRIMARY KEY,
                 run_id VARCHAR(36),
@@ -233,19 +298,22 @@ class PostgresAdapter(DatabaseAdapter):
                 end_time TIMESTAMPTZ,
                 error_message TEXT
             );
-        """)
+        """
+        )
 
-    def _create_production_schema_if_not_exists(self, cur) -> None:
+    def _create_production_schema_if_not_exists(self, cur: cursor) -> None:
         """Creates the production schema and its tables if they don't exist."""
         print(f"Ensuring production schema '{self.production_schema}' exists...")
         cur.execute(f"CREATE SCHEMA IF NOT EXISTS {self.production_schema};")
         # Swap out the schema name to create the production tables
-        production_ddl = self._get_schema_ddl().replace(self.staging_schema, self.production_schema)
+        production_ddl = self._get_schema_ddl().replace(
+            self.staging_schema, self.production_schema
+        )
         cur.execute(production_ddl)
         self._create_metadata_tables(cur)
         print("Production schema is ready.")
 
-    def _execute_delta_update(self, cur) -> None:
+    def _execute_delta_update(self, cur: cursor) -> None:
         """Orchestrates the SQL operations for a delta update."""
         print("Starting delta update process...")
 
@@ -255,11 +323,17 @@ class PostgresAdapter(DatabaseAdapter):
         self._upsert_taxonomy(cur)
 
         # 2. Sync child tables (Delete old, insert new)
-        self._sync_child_table(cur, 'accessions', ['protein_accession', 'secondary_accession'])
-        self._sync_child_table(cur, 'genes', ['protein_accession', 'gene_name'])
-        self._sync_child_table(cur, 'keywords', ['protein_accession', 'keyword_id'])
-        self._sync_child_table(cur, 'protein_to_go', ['protein_accession', 'go_term_id'])
-        self._sync_child_table(cur, 'protein_to_taxonomy', ['protein_accession', 'ncbi_taxid'])
+        self._sync_child_table(
+            cur, "accessions", ["protein_accession", "secondary_accession"]
+        )
+        self._sync_child_table(cur, "genes", ["protein_accession", "gene_name"])
+        self._sync_child_table(cur, "keywords", ["protein_accession", "keyword_id"])
+        self._sync_child_table(
+            cur, "protein_to_go", ["protein_accession", "go_term_id"]
+        )
+        self._sync_child_table(
+            cur, "protein_to_taxonomy", ["protein_accession", "ncbi_taxid"]
+        )
 
         # 3. Handle deleted proteins
         self._delete_removed_proteins(cur)
@@ -270,7 +344,7 @@ class PostgresAdapter(DatabaseAdapter):
         cur.execute(f"ANALYZE {self.production_schema}.sequences;")
         cur.execute(f"ANALYZE {self.production_schema}.taxonomy;")
 
-    def _upsert_proteins(self, cur) -> None:
+    def _upsert_proteins(self, cur: cursor) -> None:
         print("Upserting proteins...")
         sql = f"""
         INSERT INTO {self.production_schema}.proteins
@@ -288,7 +362,7 @@ class PostgresAdapter(DatabaseAdapter):
         cur.execute(sql)
         print(f"{cur.rowcount} proteins upserted.")
 
-    def _upsert_sequences(self, cur) -> None:
+    def _upsert_sequences(self, cur: cursor) -> None:
         print("Upserting sequences...")
         sql = f"""
         INSERT INTO {self.production_schema}.sequences
@@ -299,7 +373,7 @@ class PostgresAdapter(DatabaseAdapter):
         cur.execute(sql)
         print(f"{cur.rowcount} sequences upserted.")
 
-    def _upsert_taxonomy(self, cur) -> None:
+    def _upsert_taxonomy(self, cur: cursor) -> None:
         print("Upserting taxonomy...")
         sql = f"""
         INSERT INTO {self.production_schema}.taxonomy
@@ -311,7 +385,9 @@ class PostgresAdapter(DatabaseAdapter):
         cur.execute(sql)
         print(f"{cur.rowcount} taxonomy terms upserted.")
 
-    def _sync_child_table(self, cur, table_name: str, primary_keys: list[str]):
+    def _sync_child_table(
+        self, cur: cursor, table_name: str, primary_keys: list[str]
+    ) -> None:
         print(f"Syncing child table: {table_name}...")
         pk_string = ", ".join(primary_keys)
 
@@ -336,7 +412,7 @@ class PostgresAdapter(DatabaseAdapter):
         cur.execute(insert_sql)
         print(f"  - {cur.rowcount} new records inserted.")
 
-    def _delete_removed_proteins(self, cur) -> None:
+    def _delete_removed_proteins(self, cur: cursor) -> None:
         print("Identifying and deleting removed proteins...")
         # Find proteins in production that are NOT in staging
         find_deleted_sql = f"""
@@ -355,27 +431,35 @@ class PostgresAdapter(DatabaseAdapter):
 
         print(f"Found {len(deleted_accessions)} proteins to delete.")
         # The CASCADE on the foreign key will handle deletion from all child tables
-        delete_sql = f"DELETE FROM {self.production_schema}.proteins WHERE primary_accession = ANY(%s);"
+        delete_sql = (
+            f"DELETE FROM {self.production_schema}.proteins WHERE primary_accession = ANY(%s);"
+        )
         cur.execute(delete_sql, (deleted_accessions,))
-        print(f"{cur.rowcount} proteins and their related data deleted from production.")
+        print(
+            f"{cur.rowcount} proteins and their related data deleted from production."
+        )
 
-    def update_metadata(self, release_info: dict) -> None:
+    def update_metadata(self, release_info: dict[str, Any]) -> None:
         """
         Updates the metadata table with the new release information.
         This should be called after a successful load and schema swap.
         """
-        print(f"Updating metadata for release [cyan]{release_info['release_version']}[/cyan]...")
+        print(
+            f"Updating metadata for release [cyan]{release_info['version']}[/cyan]..."
+        )
         # This table should only ever contain one row: the current release.
         # We truncate it before inserting the new record to enforce this.
-        truncate_sql = f"TRUNCATE TABLE {self.production_schema}.py_load_uniprot_metadata;"
+        truncate_sql = (
+            f"TRUNCATE TABLE {self.production_schema}.py_load_uniprot_metadata;"
+        )
         insert_sql = f"""
         INSERT INTO {self.production_schema}.py_load_uniprot_metadata (
-            release_version,
+            version,
             release_date,
             swissprot_entry_count,
             trembl_entry_count
         ) VALUES (
-            %(release_version)s,
+            %(version)s,
             %(release_date)s,
             %(swissprot_entry_count)s,
             %(trembl_entry_count)s
@@ -387,11 +471,12 @@ class PostgresAdapter(DatabaseAdapter):
             conn.commit()
         print("[green]Metadata table updated successfully.[/green]")
 
-
     def get_current_release_version(self) -> str | None:
         """Retrieves the version of UniProt currently loaded in the production DB."""
-        print(f"Checking for current release version in schema [cyan]'{self.production_schema}'[/cyan]...")
-        sql = f"SELECT release_version FROM {self.production_schema}.py_load_uniprot_metadata ORDER BY load_timestamp DESC LIMIT 1;"
+        print(
+            f"Checking for current release version in schema [cyan]'{self.production_schema}'[/cyan]..."
+        )
+        sql = f"SELECT version FROM {self.production_schema}.py_load_uniprot_metadata ORDER BY load_timestamp DESC LIMIT 1;"
         try:
             with postgres_connection() as conn, conn.cursor() as cur:
                 cur.execute(sql)
@@ -399,20 +484,35 @@ class PostgresAdapter(DatabaseAdapter):
                 if result:
                     version = result[0]
                     print(f"[green]Found current release version: {version}[/green]")
-                    return version
+                    return str(version)
                 else:
-                    print("[yellow]No release version found in metadata table.[/yellow]")
+                    print(
+                        "[yellow]No release version found in metadata table.[/yellow]"
+                    )
                     return None
         except psycopg2.errors.UndefinedTable:
-            print(f"[yellow]Metadata table not found in schema '{self.production_schema}'. Database may not be initialized.[/yellow]")
+            print(
+                f"[yellow]Metadata table not found in schema '{self.production_schema}'. Database may not be initialized.[/yellow]"
+            )
             return None
 
-    def log_run(self, run_id: str, mode: str, dataset: str, status: str, start_time: datetime, end_time: datetime, error_message: str | None = None) -> None:
+    def log_run(
+        self,
+        run_id: str,
+        mode: str,
+        dataset: str,
+        status: str,
+        start_time: datetime,
+        end_time: datetime,
+        error_message: str | None = None,
+    ) -> None:
         """
         Inserts a single, complete record into the load_history table.
         """
         color = "green" if status == "COMPLETED" else "red"
-        print(f"Logging pipeline run for run_id: [cyan]{run_id}[/cyan] with status [{color}][bold]{status}[/bold][/{color}]")
+        print(
+            f"Logging pipeline run for run_id: [cyan]{run_id}[/cyan] with status [{color}][bold]{status}[/bold][/{color}]"
+        )
         sql = f"""
         INSERT INTO {self.production_schema}.load_history (
             run_id, status, mode, dataset, start_time, end_time, error_message
@@ -424,15 +524,18 @@ class PostgresAdapter(DatabaseAdapter):
             with postgres_connection() as conn, conn.cursor() as cur:
                 # Ensure the production schema and table exist before logging
                 self._create_production_schema_if_not_exists(cur)
-                cur.execute(sql, {
-                    "run_id": run_id,
-                    "status": status,
-                    "mode": mode,
-                    "dataset": dataset,
-                    "start_time": start_time,
-                    "end_time": end_time,
-                    "error_message": error_message,
-                })
+                cur.execute(
+                    sql,
+                    {
+                        "run_id": run_id,
+                        "status": status,
+                        "mode": mode,
+                        "dataset": dataset,
+                        "start_time": start_time,
+                        "end_time": end_time,
+                        "error_message": error_message,
+                    },
+                )
                 conn.commit()
         except Exception as e:
             print(f"[bold red]Failed to log pipeline run: {e}[/bold red]")

@@ -32,4 +32,4 @@ db:
 urls:
   uniprot_ftp_base_url: "https://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/complete/"
   release_notes_filename: "reldate.txt"
-  checksums_filename: "md5"
+  checksums_filename: "MD5SUMS"

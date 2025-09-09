@@ -7,9 +7,9 @@ import pytest
 from testcontainers.postgres import PostgresContainer
 from typer.testing import CliRunner
 
-from py_load_uniprot import extractor, transformer
+from py_load_uniprot import PyLoadUniprotPipeline, extractor, transformer
 from py_load_uniprot.cli import app
-from py_load_uniprot.config import initialize_settings
+from py_load_uniprot.config import Settings, load_settings
 from py_load_uniprot.db_manager import (
     TABLE_LOAD_ORDER,
     PostgresAdapter,
@@ -80,40 +80,51 @@ def sample_xml_file(tmp_path: Path, sample_xml_content: str) -> Path:
 
 
 @pytest.fixture
-def db_adapter(postgres_container: PostgresContainer):
+def settings(postgres_container: PostgresContainer) -> Settings:
     """
-    Provides a PostgresAdapter and initializes settings to use the test container.
-    This fixture allows for component-level testing of the db_adapter.
+    Provides a Settings object configured to use the test container.
     """
-    from py_load_uniprot import config
-    from py_load_uniprot.config import get_settings
-
-    config._settings = None
-    # Initialize settings with the test database connection details
-    initialize_settings()
-    settings = get_settings()
+    # Use load_settings which initializes a new object each time
+    settings = load_settings()
     settings.db.host = postgres_container.get_container_host_ip()
     settings.db.port = int(postgres_container.get_exposed_port(5432))
     settings.db.user = postgres_container.username
     settings.db.password = postgres_container.password
     settings.db.dbname = postgres_container.dbname
+    return settings
 
+
+@pytest.fixture
+def db_adapter(settings: Settings):
+    """
+    Provides a PostgresAdapter configured to use the test container.
+    This fixture also handles schema cleanup after each test.
+    """
     adapter = PostgresAdapter(
+        settings,
         staging_schema="integration_test_staging",
         production_schema="integration_test_public",
     )
     yield adapter
-    # Cleanup: drop the production schema after the test
-    print("Tearing down integration test schema...")
+    # Cleanup: drop all related schemas after the test
+    print("Tearing down integration test schemas...")
     try:
-        with postgres_connection() as conn, conn.cursor() as cur:
+        with postgres_connection(settings) as conn, conn.cursor() as cur:
+            # Drop the main schemas
             cur.execute(f"DROP SCHEMA IF EXISTS {adapter.production_schema} CASCADE;")
+            cur.execute(f"DROP SCHEMA IF EXISTS {adapter.staging_schema} CASCADE;")
+            # Drop any archived schemas left over from full loads
+            cur.execute(
+                "SELECT nspname FROM pg_namespace WHERE nspname LIKE %s;",
+                (f"{adapter.production_schema}_old_%",),
+            )
+            for row in cur.fetchall():
+                print(f"Dropping archived schema: {row[0]}")
+                cur.execute(f"DROP SCHEMA IF EXISTS {row[0]} CASCADE;")
             conn.commit()
-        print("Test schema torn down successfully.")
+        print("Test schemas torn down successfully.")
     except psycopg2.Error as e:
         print(f"Error during teardown: {e}")
-    finally:
-        config._settings = None
 
 
 # V2: P12345 is modified, P67890 is deleted, A0A0A0 is new
@@ -160,70 +171,65 @@ def sample_xml_v2_file(tmp_path: Path) -> Path:
     return xml_path
 
 
-def test_full_etl_pipeline_components(
-    sample_xml_file: Path, db_adapter: PostgresAdapter, tmp_path: Path
+def test_full_etl_pipeline_api(
+    settings: Settings, sample_xml_file: Path, mocker
 ):
     """
-    Tests the database adapter components: Transform -> Initialize -> Load -> Finalize -> Metadata.
-    This test requires a running PostgreSQL instance and uses the db_adapter fixture.
+    Tests the full end-to-end pipeline using the new programmatic API.
     """
-    # Arrange
-    output_dir = tmp_path / "transformed_output"
-    release_info = {
-        "version": "2025_TEST",
+    # --- Arrange ---
+    # Point data_dir to the temp directory where the sample file is
+    settings.data_dir = sample_xml_file.parent
+    # The pipeline will look for 'uniprot_sprot.xml.gz', so we rename our sample
+    sprot_file = settings.data_dir / "uniprot_sprot.xml.gz"
+    sample_xml_file.rename(sprot_file)
+
+    # Mock the extractor's get_release_info to avoid network calls
+    # and provide a consistent version for the test.
+    mock_release_info = {
+        "version": "2025_API_TEST",
         "release_date": datetime.date(2025, 1, 31),
         "swissprot_entry_count": 1,
         "trembl_entry_count": 1,
     }
+    mocker.patch.object(
+        extractor.Extractor, "get_release_info", return_value=mock_release_info
+    )
 
     # --- Act ---
-    # 1. Transform
-    transformer.transform_xml_to_tsv(sample_xml_file, output_dir, profile="full")
-
-    # 2. Initialize
-    db_adapter.initialize_schema(mode="full")
-
-    # 3. Load
-    for table_name in TABLE_LOAD_ORDER:
-        file_path = output_dir / f"{table_name}.tsv.gz"
-        if file_path.exists():
-            db_adapter.bulk_load_intermediate(file_path, table_name)
-
-    # 4. Finalize
-    db_adapter.finalize_load(mode="full")
-
-    # 5. Update Metadata
-    db_adapter.update_metadata(release_info)
+    # Initialize and run the pipeline
+    pipeline = PyLoadUniprotPipeline(settings)
+    pipeline.run(dataset="swissprot", mode="full")
 
     # --- Assert ---
-    with postgres_connection() as conn, conn.cursor() as cur:
+    with postgres_connection(settings) as conn, conn.cursor() as cur:
         # Assert schema and table structure
         cur.execute(
             "SELECT 1 FROM pg_namespace WHERE nspname = %s",
-            (db_adapter.production_schema,),
+            (pipeline.db_adapter.production_schema,),
         )
         assert cur.fetchone() is not None, "Production schema should exist"
         cur.execute(
             "SELECT 1 FROM pg_namespace WHERE nspname = %s",
-            (db_adapter.staging_schema,),
+            (pipeline.db_adapter.staging_schema,),
         )
         assert cur.fetchone() is None, "Staging schema should have been renamed"
 
         # Assert data integrity
-        cur.execute(f"SELECT COUNT(*) FROM {db_adapter.production_schema}.proteins")
+        cur.execute(f"SELECT COUNT(*) FROM {pipeline.db_adapter.production_schema}.proteins")
         assert cur.fetchone()[0] == 2
         cur.execute(
-            f"SELECT uniprot_id FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'"
+            f"SELECT uniprot_id FROM {pipeline.db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'"
         )
         assert cur.fetchone()[0] == "TEST1_HUMAN"
 
         # Assert Metadata
         cur.execute(
-            f"SELECT version, release_date FROM {db_adapter.production_schema}.py_load_uniprot_metadata"
+            f"SELECT version, release_date FROM {pipeline.db_adapter.production_schema}.py_load_uniprot_metadata"
         )
         metadata_row = cur.fetchone()
         assert metadata_row is not None, "Metadata row should exist"
-        assert metadata_row[0] == "2025_TEST"
+        assert metadata_row[0] == "2025_API_TEST"
         assert metadata_row[1] == datetime.date(2025, 1, 31)
 
 
@@ -255,34 +261,35 @@ def sample_xml_with_evidence_file(
 
 
 def test_evidence_data_is_transformed_and_loaded(
-    sample_xml_with_evidence_file: Path, db_adapter: PostgresAdapter, tmp_path: Path
+    settings: Settings, sample_xml_with_evidence_file: Path, mocker
 ):
     """
-    Tests that the transformer correctly parses evidence tags and the db_adapter
-    correctly loads this data into the JSONB column.
-    This is a focused component test.
+    Tests that evidence tags are correctly parsed and loaded via the pipeline API.
     """
     # Arrange
-    output_dir = tmp_path / "evidence_output"
+    settings.data_dir = sample_xml_with_evidence_file.parent
+    sprot_file = settings.data_dir / "uniprot_sprot.xml.gz"
+    sample_xml_with_evidence_file.rename(sprot_file)
 
-    # Act
-    # 1. Transform the specific XML with evidence tags
-    transformer.transform_xml_to_tsv(
-        sample_xml_with_evidence_file, output_dir, profile="full"
+    mocker.patch.object(
+        extractor.Extractor,
+        "get_release_info",
+        return_value={
+            "version": "EVIDENCE_TEST",
+            "release_date": datetime.date(2025, 1, 1),
+            "swissprot_entry_count": 1,
+            "trembl_entry_count": 0,
+        },
     )
 
-    # 2. Load it into the database
-    db_adapter.initialize_schema(mode="full")
-    for table_name in TABLE_LOAD_ORDER:
-        file_path = output_dir / f"{table_name}.tsv.gz"
-        if file_path.exists():
-            db_adapter.bulk_load_intermediate(file_path, table_name)
-    db_adapter.finalize_load(mode="full")
+    # Act
+    pipeline = PyLoadUniprotPipeline(settings)
+    pipeline.run(dataset="swissprot", mode="full")
 
     # Assert
-    with postgres_connection() as conn, conn.cursor() as cur:
+    with postgres_connection(settings) as conn, conn.cursor() as cur:
         cur.execute(
-            f"SELECT evidence_data FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'"
+            f"SELECT evidence_data FROM {pipeline.db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'"
         )
         evidence_row = cur.fetchone()
         assert evidence_row is not None, "Protein P12345 should be loaded"
@@ -303,79 +310,76 @@ def test_evidence_data_is_transformed_and_loaded(
 
 
 def test_delta_load_pipeline(
-    sample_xml_file: Path,
-    sample_xml_v2_file: Path,
-    db_adapter: PostgresAdapter,
-    tmp_path: Path,
+    settings: Settings, sample_xml_file: Path, sample_xml_v2_file: Path, mocker
 ):
     """
-    Tests the delta load functionality by performing a full load, then a delta load,
-    and verifying the state of the database after each step.
+    Tests the delta load functionality using the high-level pipeline API.
     """
-    # Arrange
-    output_dir_v1 = tmp_path / "transformed_v1"
-    output_dir_v2 = tmp_path / "transformed_v2"
+    # --- Arrange ---
+    # The pipeline will look for 'uniprot_sprot.xml.gz', so we need to manage
+    # which sample file has that name at each stage.
+    settings.data_dir = sample_xml_file.parent
+    sprot_file = settings.data_dir / "uniprot_sprot.xml.gz"
+    sample_xml_file.rename(sprot_file)
+
+    pipeline = PyLoadUniprotPipeline(settings)
 
     # --- Act 1: Initial Full Load (V1) ---
     print("--- Running Initial Full Load (V1) ---")
-    transformer.transform_xml_to_tsv(sample_xml_file, output_dir_v1, profile="full")
-    db_adapter.initialize_schema(mode="full")
-    for table_name in TABLE_LOAD_ORDER:
-        file_path = output_dir_v1 / f"{table_name}.tsv.gz"
-        if file_path.exists():
-            db_adapter.bulk_load_intermediate(file_path, table_name)
-    db_adapter.finalize_load(mode="full")
-    db_adapter.update_metadata(
-        {
+    mocker.patch.object(
+        extractor.Extractor,
+        "get_release_info",
+        return_value={
             "version": "V1_TEST",
             "release_date": datetime.date(2024, 1, 1),
-            "swissprot_entry_count": 1,
-            "trembl_entry_count": 1,
-        }
+            "swissprot_entry_count": 2,
+            "trembl_entry_count": 0,
+        },
     )
+    pipeline.run(dataset="swissprot", mode="full")
     print("--- Full Load (V1) Complete ---")
 
     # --- Assert 1: State after Full Load ---
-    with postgres_connection() as conn, conn.cursor() as cur:
-        cur.execute(f"SELECT COUNT(*) FROM {db_adapter.production_schema}.proteins")
+    with postgres_connection(settings) as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT COUNT(*) FROM {pipeline.db_adapter.production_schema}.proteins")
         assert cur.fetchone()[0] == 2
         cur.execute(
-            f"SELECT uniprot_id FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'"
+            f"SELECT uniprot_id FROM {pipeline.db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'"
         )
         assert cur.fetchone()[0] == "TEST1_HUMAN"
         cur.execute(
-            f"SELECT 1 FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P67890'"
+            f"SELECT 1 FROM {pipeline.db_adapter.production_schema}.proteins WHERE primary_accession = 'P67890'"
         )
         assert cur.fetchone() is not None
 
     # --- Act 2: Delta Load (V2) ---
     print("--- Running Delta Load (V2) ---")
-    transformer.transform_xml_to_tsv(sample_xml_v2_file, output_dir_v2, profile="full")
-    db_adapter.initialize_schema(mode="delta")  # Re-initialize STAGING schema
-    for table_name in TABLE_LOAD_ORDER:
-        file_path = output_dir_v2 / f"{table_name}.tsv.gz"
-        if file_path.exists():
-            db_adapter.bulk_load_intermediate(file_path, table_name)
-    db_adapter.finalize_load(mode="delta")
-    db_adapter.update_metadata(
-        {
+    # Rename files so the V2 file is now the source
+    sprot_file.rename(settings.data_dir / "uniprot_sprot_v1.xml.gz")
+    sample_xml_v2_file.rename(sprot_file)
+
+    mocker.patch.object(
+        extractor.Extractor,
+        "get_release_info",
+        return_value={
             "version": "V2_TEST",
             "release_date": datetime.date(2025, 1, 1),
             "swissprot_entry_count": 2,
             "trembl_entry_count": 0,
-        }
+        },
     )
+    pipeline.run(dataset="swissprot", mode="delta")
     print("--- Delta Load (V2) Complete ---")
 
     # --- Assert 2: State after Delta Load ---
-    with postgres_connection() as conn, conn.cursor() as cur:
+    with postgres_connection(settings) as conn, conn.cursor() as cur:
         # Check total count: 2 (initial) - 1 (deleted) + 1 (new) = 2
-        cur.execute(f"SELECT COUNT(*) FROM {db_adapter.production_schema}.proteins")
+        cur.execute(f"SELECT COUNT(*) FROM {pipeline.db_adapter.production_schema}.proteins")
         assert cur.fetchone()[0] == 2, "Total protein count should be 2 after delta."
 
         # Check that P12345 was updated
         cur.execute(
-            f"SELECT uniprot_id, sequence_length FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'"
+            f"SELECT uniprot_id, sequence_length FROM {pipeline.db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'"
         )
         updated_protein = cur.fetchone()
         assert (
@@ -387,13 +391,13 @@ def test_delta_load_pipeline(
 
         # Check that P67890 was deleted
         cur.execute(
-            f"SELECT 1 FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P67890'"
+            f"SELECT 1 FROM {pipeline.db_adapter.production_schema}.proteins WHERE primary_accession = 'P67890'"
         )
         assert cur.fetchone() is None, "Protein P67890 should have been deleted."
 
         # Check that A0A0A0 was inserted
         cur.execute(
-            f"SELECT uniprot_id FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'A0A0A0'"
+            f"SELECT uniprot_id FROM {pipeline.db_adapter.production_schema}.proteins WHERE primary_accession = 'A0A0A0'"
         )
         assert (
             cur.fetchone()[0] == "TEST3_NEW"
@@ -401,37 +405,80 @@ def test_delta_load_pipeline(
 
         # Check that metadata was updated to V2
         cur.execute(
-            f"SELECT version FROM {db_adapter.production_schema}.py_load_uniprot_metadata"
+            f"SELECT version FROM {pipeline.db_adapter.production_schema}.py_load_uniprot_metadata"
         )
         assert cur.fetchone()[0] == "V2_TEST"
 
 
-def test_status_command_reporting(
-    db_adapter: PostgresAdapter, sample_xml_file: Path, tmp_path: Path
-):
+def test_delta_load_version_check(settings: Settings, sample_xml_file: Path, mocker):
     """
-    Tests that the get_current_release_version function (used by the status command)
-    reports the correct status before and after a load.
+    Tests that the delta load version check correctly prevents re-runs or
+    running against an older version.
+    """
+    # --- Arrange: Perform an initial full load ---
+    settings.data_dir = sample_xml_file.parent
+    sprot_file = settings.data_dir / "uniprot_sprot.xml.gz"
+    sample_xml_file.rename(sprot_file)
+    pipeline = PyLoadUniprotPipeline(settings)
+
+    release_info_v1 = {
+        "version": "V1_TEST",
+        "release_date": datetime.date(2024, 1, 1),
+        "swissprot_entry_count": 2,
+        "trembl_entry_count": 0,
+    }
+    mocker.patch.object(
+        extractor.Extractor, "get_release_info", return_value=release_info_v1
+    )
+    pipeline.run(dataset="swissprot", mode="full")
+
+    # --- Act & Assert 1: Attempting to re-run the same version ---
+    # The run method should return early without making changes.
+    print("--- Attempting delta load with same version ---")
+    pipeline.run(dataset="swissprot", mode="delta")
+
+    # Verify no data was changed
+    with postgres_connection(settings) as conn, conn.cursor() as cur:
+        cur.execute(
+            f"SELECT uniprot_id FROM {pipeline.db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'"
+        )
+        assert cur.fetchone()[0] == "TEST1_HUMAN"  # Should be unchanged from V1
+
+    # --- Act & Assert 2: Attempting to run an older version ---
+    print("--- Attempting delta load with older version ---")
+    release_info_v0 = {
+        "version": "V0_TEST_OLDER",
+        "release_date": datetime.date(2023, 1, 1),
+        "swissprot_entry_count": 0,
+        "trembl_entry_count": 0,
+    }
+    mocker.patch.object(
+        extractor.Extractor, "get_release_info", return_value=release_info_v0
+    )
+    with pytest.raises(ValueError, match="Source data is older"):
+        pipeline.run(dataset="swissprot", mode="delta")
+
+
+def test_status_command_reporting(settings: Settings, db_adapter: PostgresAdapter):
+    """
+    Tests that the get_current_release_version function reports the correct status.
     """
     # 1. Before anything is loaded, it should return None
     version = db_adapter.get_current_release_version()
     assert version is None, "Version should be None for an uninitialized database"
 
-    # 2. After a full load, it should return the correct version
-    output_dir = tmp_path / "transformed_output"
+    # 2. After a load, it should return the correct version
+    # Manually create the metadata to test the read path specifically
     release_info = {
         "version": "2025_STATUS_TEST",
         "release_date": datetime.date(2025, 2, 1),
         "swissprot_entry_count": 1,
         "trembl_entry_count": 1,
     }
-    transformer.transform_xml_to_tsv(sample_xml_file, output_dir, profile="full")
-    db_adapter.initialize_schema(mode="full")
-    for table_name in TABLE_LOAD_ORDER:
-        file_path = output_dir / f"{table_name}.tsv.gz"
-        if file_path.exists():
-            db_adapter.bulk_load_intermediate(file_path, table_name)
-    db_adapter.finalize_load(mode="full")
+    with postgres_connection(settings) as conn, conn.cursor() as cur:
+        db_adapter._create_production_schema_if_not_exists(cur)
+        conn.commit()
+
     db_adapter.update_metadata(release_info)
 
     # Now, check the version again

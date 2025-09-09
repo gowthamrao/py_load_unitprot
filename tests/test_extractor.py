@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 
-from py_load_uniprot.config import Settings, get_settings, initialize_settings
+from py_load_uniprot.config import Settings, load_settings
 from py_load_uniprot.extractor import Extractor
 
 
@@ -22,16 +22,11 @@ def temp_data_dir(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def settings(temp_data_dir: Path):
+def settings(temp_data_dir: Path) -> Settings:
     """A fixture to provide a Settings object for tests."""
-    from py_load_uniprot import config
-
-    config._settings = None
-    initialize_settings()
-    s = get_settings()
-    s.data_dir = temp_data_dir
-    yield s
-    config._settings = None
+    settings = load_settings()
+    settings.data_dir = temp_data_dir
+    return settings
 
 
 @pytest.fixture

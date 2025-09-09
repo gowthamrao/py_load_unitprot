@@ -8,9 +8,9 @@ from rich.markup import escape
 from typing_extensions import Annotated
 
 from py_load_uniprot import extractor
-from py_load_uniprot.config import get_settings, initialize_settings
+from py_load_uniprot.config import load_settings
+from py_load_uniprot.core import PyLoadUniprotPipeline
 from py_load_uniprot.db_manager import PostgresAdapter
-from py_load_uniprot.pipeline import PyLoadUniprotPipeline
 
 app = typer.Typer(
     name="py-load-uniprot",
@@ -18,10 +18,14 @@ app = typer.Typer(
     add_completion=False,
 )
 
+# Create a common context object to hold the config file path
+class AppContext:
+    def __init__(self, config_file: Optional[Path]):
+        self.config_file = config_file
 
-# This callback will run before any command, initializing the settings
 @app.callback(invoke_without_command=True)
 def main_callback(
+    ctx: typer.Context,
     config: Annotated[
         Optional[Path],
         typer.Option(
@@ -37,22 +41,14 @@ def main_callback(
     ] = None,
 ) -> None:
     """
-    Main entrypoint for the CLI. Initializes configuration.
+    Main entrypoint for the CLI. Manages the configuration context.
     """
-    try:
-        initialize_settings(config_file=config)
-    except FileNotFoundError as e:
-        print(f"[bold red]Configuration Error: {escape(str(e))}[/bold red]")
-        raise typer.Exit(code=1)
-    except Exception as e:
-        print(
-            f"[bold red]An unexpected error occurred during initialization: {escape(str(e))}[/bold red]"
-        )
-        raise typer.Exit(code=1)
+    ctx.obj = AppContext(config_file=config)
 
 
 @app.command()
 def download(
+    ctx: typer.Context,
     dataset: str = typer.Option(
         "swissprot", help="Dataset to download ('swissprot', 'trembl', or 'all')."
     ),
@@ -76,7 +72,7 @@ def download(
         raise typer.Exit(code=1)
 
     try:
-        settings = get_settings()
+        settings = load_settings(config_file=ctx.obj.config_file)
         data_extractor = extractor.Extractor(settings)
         failed_downloads = []
 
@@ -135,6 +131,7 @@ def download(
 
 @app.command()
 def run(
+    ctx: typer.Context,
     dataset: str = typer.Option(
         "swissprot", help="Dataset to load ('swissprot', 'trembl', or 'all')."
     ),
@@ -144,7 +141,8 @@ def run(
     Run the full ETL pipeline for a specified dataset and load mode.
     """
     try:
-        pipeline = PyLoadUniprotPipeline()
+        settings = load_settings(config_file=ctx.obj.config_file)
+        pipeline = PyLoadUniprotPipeline(settings)
         pipeline.run(dataset=dataset, mode=mode)
     except (ValueError, FileNotFoundError) as e:
         print(f"\n[bold red]Configuration Error: {escape(str(e))}[/bold red]")
@@ -160,13 +158,13 @@ def run(
 
 
 @app.command()
-def check_config() -> None:
+def check_config(ctx: typer.Context) -> None:
     """
     Validates the current configuration and checks database connectivity.
     """
     print("[bold blue]Checking configuration and connectivity...[/bold blue]")
     try:
-        settings = get_settings()
+        settings = load_settings(config_file=ctx.obj.config_file)
         # 1. Print configuration
         print("\n[bold]Current Settings:[/bold]")
 
@@ -180,7 +178,7 @@ def check_config() -> None:
 
         # 2. Check database connection
         print("\n[bold]Checking database connectivity...[/bold]")
-        db_adapter = PostgresAdapter()
+        db_adapter = PostgresAdapter(settings)
         db_adapter.check_connection()
         print("[green]Database connection successful.[/green]")
 
@@ -197,14 +195,15 @@ def check_config() -> None:
 
 
 @app.command()
-def initialize() -> None:
+def initialize(ctx: typer.Context) -> None:
     """
     Initializes the production database schema (uniprot_public) for first-time setup.
     This command is idempotent and will not harm an existing schema.
     """
     print("[bold blue]Initializing database schema for first-time use...[/bold blue]")
     try:
-        db_adapter = PostgresAdapter()
+        settings = load_settings(config_file=ctx.obj.config_file)
+        db_adapter = PostgresAdapter(settings)
         db_adapter.create_production_schema()
         print(
             "\n[bold green]CLI command 'initialize' completed successfully.[/bold green]"
@@ -218,13 +217,14 @@ def initialize() -> None:
 
 
 @app.command()
-def status() -> None:
+def status(ctx: typer.Context) -> None:
     """
     Checks and displays the currently loaded UniProt release version in the database.
     """
     print("[bold blue]Checking database status...[/bold blue]")
     try:
-        db_adapter = PostgresAdapter()
+        settings = load_settings(config_file=ctx.obj.config_file)
+        db_adapter = PostgresAdapter(settings)
         version = db_adapter.get_current_release_version()
         if version:
             print(

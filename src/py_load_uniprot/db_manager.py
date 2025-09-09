@@ -1,4 +1,5 @@
 import gzip
+import importlib.resources
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from datetime import datetime
@@ -115,35 +116,27 @@ class PostgresAdapter(DatabaseAdapter):
             self._create_production_schema_if_not_exists(cur)
             conn.commit()
 
-    def _get_schema_ddl(self) -> str:
-        # Same as before, but good to have it defined once
-        return f"""
-        CREATE SCHEMA IF NOT EXISTS {self.staging_schema};
-        CREATE TABLE IF NOT EXISTS {self.staging_schema}.proteins ( primary_accession VARCHAR(255) PRIMARY KEY, uniprot_id VARCHAR(255), sequence_length INTEGER, molecular_weight INTEGER, created_date DATE, modified_date DATE, comments_data JSONB, features_data JSONB, db_references_data JSONB, evidence_data JSONB );
-        CREATE TABLE IF NOT EXISTS {self.staging_schema}.sequences ( primary_accession VARCHAR(255) PRIMARY KEY, sequence TEXT, FOREIGN KEY (primary_accession) REFERENCES {self.staging_schema}.proteins(primary_accession) ON DELETE CASCADE );
-        CREATE TABLE IF NOT EXISTS {self.staging_schema}.accessions ( protein_accession VARCHAR(255), secondary_accession VARCHAR(255), PRIMARY KEY (protein_accession, secondary_accession), FOREIGN KEY (protein_accession) REFERENCES {self.staging_schema}.proteins(primary_accession) ON DELETE CASCADE );
-        CREATE TABLE IF NOT EXISTS {self.staging_schema}.taxonomy ( ncbi_taxid INTEGER PRIMARY KEY, scientific_name VARCHAR(1023), lineage TEXT );
-        CREATE TABLE IF NOT EXISTS {self.staging_schema}.genes ( protein_accession VARCHAR(255), gene_name VARCHAR(255), is_primary BOOLEAN, PRIMARY KEY (protein_accession, gene_name), FOREIGN KEY (protein_accession) REFERENCES {self.staging_schema}.proteins(primary_accession) ON DELETE CASCADE );
-        CREATE TABLE IF NOT EXISTS {self.staging_schema}.keywords ( protein_accession VARCHAR(255), keyword_id VARCHAR(255), keyword_label VARCHAR(255), PRIMARY KEY (protein_accession, keyword_id), FOREIGN KEY (protein_accession) REFERENCES {self.staging_schema}.proteins(primary_accession) ON DELETE CASCADE );
-        CREATE TABLE IF NOT EXISTS {self.staging_schema}.protein_to_go ( protein_accession VARCHAR(255), go_term_id VARCHAR(255), PRIMARY KEY (protein_accession, go_term_id), FOREIGN KEY (protein_accession) REFERENCES {self.staging_schema}.proteins(primary_accession) ON DELETE CASCADE );
-        CREATE TABLE IF NOT EXISTS {self.staging_schema}.protein_to_taxonomy ( protein_accession VARCHAR(255), ncbi_taxid INTEGER, PRIMARY KEY (protein_accession, ncbi_taxid), FOREIGN KEY (protein_accession) REFERENCES {self.staging_schema}.proteins(primary_accession) ON DELETE CASCADE, FOREIGN KEY (ncbi_taxid) REFERENCES {self.staging_schema}.taxonomy(ncbi_taxid) );
+    def _get_schema_ddl(self, schema_name: str) -> str:
         """
-
-    def _get_indexes_ddl(self) -> str:
-        return f"""
-        -- B-Tree Indexes for foreign keys and common lookups
-        CREATE INDEX IF NOT EXISTS idx_proteins_uniprot_id ON {self.staging_schema}.proteins (uniprot_id);
-        CREATE INDEX IF NOT EXISTS idx_accessions_secondary ON {self.staging_schema}.accessions (secondary_accession);
-        CREATE INDEX IF NOT EXISTS idx_genes_name ON {self.staging_schema}.genes (gene_name);
-        CREATE INDEX IF NOT EXISTS idx_keywords_label ON {self.staging_schema}.keywords (keyword_label);
-        CREATE INDEX IF NOT EXISTS idx_prot_to_go_id ON {self.staging_schema}.protein_to_go (go_term_id);
-        CREATE INDEX IF NOT EXISTS idx_prot_to_taxo_id ON {self.staging_schema}.protein_to_taxonomy (ncbi_taxid);
-
-        -- GIN Indexes for JSONB columns
-        CREATE INDEX IF NOT EXISTS idx_proteins_comments_gin ON {self.staging_schema}.proteins USING GIN (comments_data);
-        CREATE INDEX IF NOT EXISTS idx_proteins_features_gin ON {self.staging_schema}.proteins USING GIN (features_data);
-        CREATE INDEX IF NOT EXISTS idx_proteins_db_refs_gin ON {self.staging_schema}.proteins USING GIN (db_references_data);
+        Reads the main schema DDL from the corresponding .sql file and substitutes the schema name.
         """
+        sql_template = (
+            importlib.resources.files("py_load_uniprot.sql")
+            .joinpath("create_schema.sql")
+            .read_text()
+        )
+        return sql_template.replace("__{SCHEMA_NAME}__", schema_name)
+
+    def _get_indexes_ddl(self, schema_name: str) -> str:
+        """
+        Reads the indexes DDL from the corresponding .sql file and substitutes the schema name.
+        """
+        sql_template = (
+            importlib.resources.files("py_load_uniprot.sql")
+            .joinpath("create_indexes.sql")
+            .read_text()
+        )
+        return sql_template.replace("__{SCHEMA_NAME}__", schema_name)
 
     def initialize_schema(self, mode: str) -> None:
         print(
@@ -152,7 +145,7 @@ class PostgresAdapter(DatabaseAdapter):
         with postgres_connection() as conn, conn.cursor() as cur:
             # In both full and delta modes, we start with a clean staging schema
             cur.execute(f"DROP SCHEMA IF EXISTS {self.staging_schema} CASCADE;")
-            cur.execute(self._get_schema_ddl())
+            cur.execute(self._get_schema_ddl(self.staging_schema))
             conn.commit()
         print("[green]Staging schema initialized successfully.[/green]")
 
@@ -204,8 +197,8 @@ class PostgresAdapter(DatabaseAdapter):
             conn.commit()
 
     def _create_indexes(self, cur: cursor) -> None:
-        print("Creating indexes on staging schema...")
-        cur.execute(self._get_indexes_ddl())
+        print(f"Creating indexes on schema '{self.staging_schema}'...")
+        cur.execute(self._get_indexes_ddl(self.staging_schema))
         print("[green]Indexes created successfully.[/green]")
 
     def _analyze_schema(self, cur: cursor) -> None:
@@ -257,7 +250,7 @@ class PostgresAdapter(DatabaseAdapter):
                 f"ALTER SCHEMA {self.staging_schema} RENAME TO {self.production_schema};"
             )
             # Now that the new production schema is live, create the metadata tables in it
-            self._create_metadata_tables(cur)
+            self._create_metadata_tables(cur, self.production_schema)
             conn.commit()
         print(
             f"[bold green]Schema swap complete. '{self.production_schema}' is now live.[/bold green]"
@@ -273,44 +266,23 @@ class PostgresAdapter(DatabaseAdapter):
             conn.commit()
         print("[bold green]Delta load complete.[/bold green]")
 
-    def _create_metadata_tables(self, cur: cursor) -> None:
-        """Creates the metadata tables in the production schema."""
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {self.production_schema}.py_load_uniprot_metadata (
-                version VARCHAR(255) PRIMARY KEY,
-                release_date DATE,
-                load_timestamp TIMESTAMPTZ DEFAULT NOW(),
-                swissprot_entry_count INTEGER,
-                trembl_entry_count INTEGER
-            );
-        """
+    def _create_metadata_tables(self, cur: cursor, schema_name: str) -> None:
+        """Creates the metadata tables in the specified schema."""
+        sql_template = (
+            importlib.resources.files("py_load_uniprot.sql")
+            .joinpath("create_metadata_tables.sql")
+            .read_text()
         )
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {self.production_schema}.load_history (
-                id SERIAL PRIMARY KEY,
-                run_id VARCHAR(36),
-                status VARCHAR(50),
-                mode VARCHAR(50),
-                dataset VARCHAR(50),
-                start_time TIMESTAMPTZ,
-                end_time TIMESTAMPTZ,
-                error_message TEXT
-            );
-        """
-        )
+        cur.execute(sql_template.replace("__{SCHEMA_NAME}__", schema_name))
 
     def _create_production_schema_if_not_exists(self, cur: cursor) -> None:
         """Creates the production schema and its tables if they don't exist."""
         print(f"Ensuring production schema '{self.production_schema}' exists...")
         cur.execute(f"CREATE SCHEMA IF NOT EXISTS {self.production_schema};")
         # Swap out the schema name to create the production tables
-        production_ddl = self._get_schema_ddl().replace(
-            self.staging_schema, self.production_schema
-        )
+        production_ddl = self._get_schema_ddl(self.production_schema)
         cur.execute(production_ddl)
-        self._create_metadata_tables(cur)
+        self._create_metadata_tables(cur, self.production_schema)
         print("Production schema is ready.")
 
     def _execute_delta_update(self, cur: cursor) -> None:
@@ -466,6 +438,8 @@ class PostgresAdapter(DatabaseAdapter):
         );
         """
         with postgres_connection() as conn, conn.cursor() as cur:
+            # Ensure the table exists before trying to truncate/insert
+            self._create_metadata_tables(cur, self.production_schema)
             cur.execute(truncate_sql)
             cur.execute(insert_sql, release_info)
             conn.commit()

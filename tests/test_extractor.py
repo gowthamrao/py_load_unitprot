@@ -175,5 +175,5 @@ def test_get_release_info_parse_error(mock_get: MagicMock, extractor: Extractor)
     mock_get.return_value = mock_response
 
     # --- Act & Assert ---
-    with pytest.raises(ValueError, match="Could not parse release information"):
+    with pytest.raises(ValueError, match="Could not parse release version/date from reldate.txt"):
         extractor.get_release_info()

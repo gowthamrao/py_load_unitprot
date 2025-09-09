@@ -5,6 +5,7 @@ import tempfile
 import shutil
 from pathlib import Path
 from rich import print
+from rich.markup import escape
 import uuid
 import traceback
 
@@ -57,7 +58,8 @@ class PyLoadUniprotPipeline:
 
             # Step 1: Extraction
             print("\n[bold]Step 1: Running data extraction...[/bold]")
-            release_info = extractor.run_extraction()
+            data_extractor = extractor.Extractor(get_settings())
+            release_info = data_extractor.get_release_info()
             print("[green]Extraction complete.[/green]")
 
             # Step 2: Initialize Schema
@@ -86,7 +88,7 @@ class PyLoadUniprotPipeline:
         except Exception as e:
             # Capture the full error traceback for detailed logging
             error_msg = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
-            print(f"[bold red]\nETL pipeline failed: {error_msg}[/bold red]")
+            print(f"[bold red]\nETL pipeline failed: {escape(error_msg)}[/bold red]")
             # Log the failure and then re-raise the exception
             self.db_adapter.log_run_end(run_id, "FAILED", error_message=error_msg)
             raise
@@ -99,7 +101,7 @@ class PyLoadUniprotPipeline:
         settings = get_settings()
         print(f"\n[bold magenta]Processing dataset: {dataset}...[/bold magenta]")
 
-        xml_filename = f"uniprot_{dataset}.xml.gz"
+        xml_filename = f"uniprot_{'sprot' if dataset == 'swissprot' else 'trembl'}.xml.gz"
         source_xml_path = settings.data_dir / xml_filename
         temp_dir = None
 
@@ -111,7 +113,7 @@ class PyLoadUniprotPipeline:
             print(f"  - Running data transformation for {dataset}...")
             temp_dir = Path(tempfile.mkdtemp(prefix=f"uniprot_{dataset}_"))
             print(f"    Intermediate files will be stored in: {temp_dir}")
-            transformer.transform_xml_to_tsv(source_xml_path, temp_dir)
+            transformer.transform_xml_to_tsv(source_xml_path, temp_dir, settings.profile)
             print(f"  - Transformation complete for {dataset}.")
 
             # Database Load into Staging

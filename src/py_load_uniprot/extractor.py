@@ -185,40 +185,66 @@ class Extractor:
             print(f"  Actual:   {actual_md5}")
             return False
 
-    def get_release_info(self) -> Dict[str, str]:
+    def get_release_info(self) -> Dict[str, str | int]:
         """
-        Downloads and parses release notes to get the current version and date,
-        then persists this metadata to a JSON file.
+        Downloads and parses release notes to get the current version, date,
+        and entry counts, then persists this metadata to a JSON file.
 
         Returns:
-            A dictionary with 'version' and 'date'.
+            A dictionary with version, date, and entry counts.
         """
         import json
-        url = f"{self.settings.urls.uniprot_ftp_base_url}{self.settings.urls.release_notes_filename}"
-        print(f"Fetching release info from {url}")
+        info = {}
 
+        # --- Get Version and Date from reldate.txt ---
+        reldate_url = f"{self.settings.urls.uniprot_ftp_base_url}{self.settings.urls.release_notes_filename}"
+        print(f"Fetching release info from {reldate_url}")
         try:
-            response = self.session.get(url)
+            response = self.session.get(reldate_url)
             response.raise_for_status()
-
-            # Example format:
-            # Release 2025_09 of 08-Sep-2025
             match = re.search(r"Release\s+(\S+)\s+of\s+(.*)", response.text)
             if match:
-                version, date = match.groups()
-                info = {'version': version, 'date': date}
-                print(f"Found release info: {info}")
-
-                # Persist the metadata
-                metadata_path = self.settings.data_dir / "release_metadata.json"
-                with open(metadata_path, 'w') as f:
-                    json.dump(info, f, indent=2)
-                print(f"Release metadata saved to {metadata_path}")
-
-                return info
+                info['version'], info['date'] = match.groups()
             else:
-                raise ValueError("Could not parse release information from reldate.txt")
-
+                raise ValueError("Could not parse release version/date from reldate.txt")
         except requests.exceptions.RequestException as e:
-            print(f"Error fetching release info: {e}")
+            print(f"Error fetching reldate.txt: {e}")
             raise
+
+        # --- Get Entry Counts from relnotes.txt ---
+        relnotes_url = "https://ftp.uniprot.org/pub/databases/uniprot/current_release/relnotes.txt"
+        print(f"Fetching statistics from {relnotes_url}")
+        try:
+            response = self.session.get(relnotes_url)
+            response.raise_for_status()
+            # Regex to find the line and capture the numbers
+            match = re.search(
+                r"UniProtKB/Swiss-Prot:\s+([\d,]+)\s+entries and UniProtKB/TrEMBL:\s+([\d,]+)\s+entries",
+                response.text
+            )
+            if match:
+                # Convert numbers with commas to integers
+                info['swissprot_entry_count'] = int(match.group(1).replace(',', ''))
+                info['trembl_entry_count'] = int(match.group(2).replace(',', ''))
+            else:
+                print("[yellow]Warning: Could not parse entry counts from relnotes.txt. Counts will be set to 0.[/yellow]")
+                info['swissprot_entry_count'] = 0
+                info['trembl_entry_count'] = 0
+        except requests.exceptions.RequestException as e:
+            print(f"[yellow]Warning: Could not fetch relnotes.txt: {e}. Counts will be set to 0.[/yellow]")
+            info['swissprot_entry_count'] = 0
+            info['trembl_entry_count'] = 0
+
+        print(f"Found release info: {info}")
+        # Persist the metadata
+        metadata_path = self.settings.data_dir / "release_metadata.json"
+        with open(metadata_path, 'w') as f:
+            # Convert date object if necessary for json serialization
+            if 'date' in info and not isinstance(info['date'], str):
+                info_copy = info.copy()
+                info_copy['date'] = info_copy['date'].isoformat()
+                json.dump(info_copy, f, indent=2)
+            else:
+                json.dump(info, f, indent=2)
+        print(f"Release metadata saved to {metadata_path}")
+        return info

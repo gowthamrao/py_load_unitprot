@@ -53,7 +53,7 @@ def _element_to_json(element) -> str | None:
     data_list = [element_to_dict(el) for el in element]
     return json.dumps(data_list) if data_list else None
 
-def _worker_parse_entry(tasks_queue: multiprocessing.Queue, results_queue: multiprocessing.Queue):
+def _worker_parse_entry(tasks_queue: multiprocessing.Queue, results_queue: multiprocessing.Queue, profile: str):
     """
     Worker process function.
     Pulls a raw XML string from the tasks queue, parses it, and puts the
@@ -66,14 +66,14 @@ def _worker_parse_entry(tasks_queue: multiprocessing.Queue, results_queue: multi
         try:
             # fromstring is faster than parsing a file-like object
             elem = etree.fromstring(xml_string)
-            parsed_data = _parse_entry(elem)
+            parsed_data = _parse_entry(elem, profile)
             results_queue.put(parsed_data)
         except etree.XMLSyntaxError:
             # Handle potential errors in XML snippets
             # In a real-world scenario, you might log this
             results_queue.put({}) # Put an empty dict to not stall the writer
 
-def _parse_entry(elem) -> dict[str, list]:
+def _parse_entry(elem, profile: str) -> dict[str, list]:
     """
     Parses a single <entry> element from the UniProt XML and extracts data
     for all target tables.
@@ -94,15 +94,26 @@ def _parse_entry(elem) -> dict[str, list]:
     modified_date = elem.get("modified")
 
     # --- JSONB Data ---
-    comments_data = _element_to_json(elem.findall(_get_tag("comment")))
-    features_data = _element_to_json(elem.findall(_get_tag("feature")))
-    # Exclude GO, taxo, etc from general db references
-    db_refs_to_exclude = {'GO', 'NCBI Taxonomy'}
-    db_references_data = _element_to_json([
-        db_ref for db_ref in elem.findall(_get_tag("dbReference"))
-        if db_ref.get("type") not in db_refs_to_exclude
-    ])
-    evidence_data = _element_to_json(elem.findall(f".//{_get_tag('evidence')}"))
+    if profile == "full":
+        comments_data = _element_to_json(elem.findall(_get_tag("comment")))
+        features_data = _element_to_json(elem.findall(_get_tag("feature")))
+        # Exclude GO, taxo, etc from general db references
+        db_refs_to_exclude = {'GO', 'NCBI Taxonomy'}
+        db_references_data = _element_to_json([
+            db_ref for db_ref in elem.findall(_get_tag("dbReference"))
+            if db_ref.get("type") not in db_refs_to_exclude
+        ])
+        evidence_data = _element_to_json(elem.findall(f".//{_get_tag('evidence')}"))
+    else:  # standard profile
+        all_comments = elem.findall(_get_tag("comment"))
+        standard_comment_types = {'function', 'disease', 'subcellular location'}
+        standard_comments = [
+            c for c in all_comments if c.get("type") in standard_comment_types
+        ]
+        comments_data = _element_to_json(standard_comments)
+        features_data = None
+        db_references_data = None
+        evidence_data = None
 
     data["proteins"].append([
         primary_accession, uniprot_id, sequence_length, molecular_weight,
@@ -222,11 +233,12 @@ def _get_total_entries(xml_file: Path) -> int:
     print(f"Found {count} total entries.")
     return count
 
-def transform_xml_to_tsv(xml_file: Path, output_dir: Path, num_workers: int = os.cpu_count()):
+def transform_xml_to_tsv(xml_file: Path, output_dir: Path, profile: str, num_workers: int = os.cpu_count()):
     """
     Parses a UniProt XML file in parallel and transforms the data into gzipped TSV files.
     """
     print(f"Starting parallel transformation of {xml_file.name} with {num_workers} worker processes...")
+    print(f"Using profile: [bold cyan]{profile}[/bold cyan]")
     print(f"Output will be written to: {output_dir.resolve()}")
 
     total_entries = _get_total_entries(xml_file)
@@ -246,8 +258,12 @@ def transform_xml_to_tsv(xml_file: Path, output_dir: Path, num_workers: int = os
         )
         writer.start()
 
-        # Start a pool of worker processes
-        pool = multiprocessing.Pool(num_workers, _worker_parse_entry, (tasks_queue, results_queue))
+        # Start a pool of worker processes, passing the profile to each worker
+        pool = multiprocessing.Pool(
+            num_workers,
+            _worker_parse_entry,
+            (tasks_queue, results_queue, profile)
+        )
 
         # --- Producer ---
         # The main process becomes the producer, reading the XML and queuing tasks

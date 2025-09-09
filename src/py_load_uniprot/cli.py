@@ -1,5 +1,6 @@
 import typer
 from rich import print
+from rich.markup import escape
 from pathlib import Path
 from typing_extensions import Annotated
 import json
@@ -38,10 +39,10 @@ def main_callback(
     try:
         initialize_settings(config_file=config)
     except FileNotFoundError as e:
-        print(f"[bold red]Configuration Error: {e}[/bold red]")
+        print(f"[bold red]Configuration Error: {escape(str(e))}[/bold red]")
         raise typer.Exit(code=1)
     except Exception as e:
-        print(f"[bold red]An unexpected error occurred during initialization: {e}[/bold red]")
+        print(f"[bold red]An unexpected error occurred during initialization: {escape(str(e))}[/bold red]")
         raise typer.Exit(code=1)
 
 
@@ -89,7 +90,7 @@ def download(
                     print(f"[bold red]Checksum verification failed for '{ds}'.[/bold red]")
                     failed_downloads.append(ds)
             except Exception as e:
-                print(f"[bold red]An error occurred while downloading {ds}: {e}[/bold red]")
+                print(f"[bold red]An error occurred while downloading {ds}: {escape(str(e))}[/bold red]")
                 failed_downloads.append(ds)
 
         if failed_downloads:
@@ -99,10 +100,10 @@ def download(
             print("\n[bold green]All specified datasets downloaded successfully.[/bold green]")
 
     except FileNotFoundError as e:
-        print(f"\n[bold red]Configuration Error: {e}[/bold red]")
+        print(f"\n[bold red]Configuration Error: {escape(str(e))}[/bold red]")
         raise typer.Exit(code=1)
     except Exception as e:
-        print(f"\n[bold red]An unexpected error occurred during the download process: {e}[/bold red]")
+        print(f"\n[bold red]An unexpected error occurred during the download process: {escape(str(e))}[/bold red]")
         import traceback
         traceback.print_exc()
         raise typer.Exit(code=1)
@@ -119,10 +120,10 @@ def run(
         pipeline = PyLoadUniprotPipeline()
         pipeline.run(dataset=dataset, mode=mode)
     except (ValueError, FileNotFoundError) as e:
-        print(f"\n[bold red]Configuration Error: {e}[/bold red]")
+        print(f"\n[bold red]Configuration Error: {escape(str(e))}[/bold red]")
         raise typer.Exit(code=1)
     except Exception as e:
-        print(f"\n[bold red]An unexpected error occurred during the ETL pipeline: {e}[/bold red]")
+        print(f"\n[bold red]An unexpected error occurred during the ETL pipeline: {escape(str(e))}[/bold red]")
         import traceback
         traceback.print_exc()
         raise typer.Exit(code=1)
@@ -157,7 +158,7 @@ def check_config():
         print("\n[bold green]Configuration and connectivity check passed.[/bold green]")
 
     except Exception as e:
-        print(f"\n[bold red]An error occurred during the check: {e}[/bold red]")
+        print(f"\n[bold red]An error occurred during the check: {escape(str(e))}[/bold red]")
         import traceback
         traceback.print_exc()
         raise typer.Exit(code=1)
@@ -176,7 +177,7 @@ def initialize():
         print("\n[bold green]CLI command 'initialize' completed successfully.[/bold green]")
         print(f"Production schema '{db_adapter.production_schema}' is ready.")
     except Exception as e:
-        print(f"\n[bold red]An error occurred during schema initialization: {e}[/bold red]")
+        print(f"\n[bold red]An error occurred during schema initialization: {escape(str(e))}[/bold red]")
         raise typer.Exit(code=1)
 
 
@@ -194,7 +195,7 @@ def status():
         else:
             print("  [yellow]No UniProt release is currently loaded in the database.[/yellow]")
     except Exception as e:
-        print(f"\n[bold red]An error occurred while checking the status: {e}[/bold red]")
+        print(f"\n[bold red]An error occurred while checking the status: {escape(str(e))}[/bold red]")
         raise typer.Exit(code=1)
 
 def main():

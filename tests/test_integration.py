@@ -5,7 +5,7 @@ import psycopg2
 import yaml
 
 from typer.testing import CliRunner
-from py_load_uniprot import transformer
+from py_load_uniprot import transformer, extractor
 from py_load_uniprot.cli import app
 from py_load_uniprot.config import Settings, initialize_settings
 from py_load_uniprot.db_manager import PostgresAdapter, postgres_connection, TABLE_LOAD_ORDER
@@ -92,7 +92,7 @@ def db_adapter(postgres_container: PostgresContainer) -> PostgresAdapter:
     # We have to monkeypatch the global settings instance for this test
     # This is less ideal than using the CLI but necessary for component testing.
     import py_load_uniprot.config
-    py_load_uniprot.config._settings_instance = test_settings
+    py_load_uniprot.config._settings = test_settings
 
     adapter = PostgresAdapter(
         staging_schema="integration_test_staging",
@@ -169,7 +169,7 @@ def test_full_etl_pipeline_components(sample_xml_file: Path, db_adapter: Postgre
 
     # --- Act ---
     # 1. Transform
-    transformer.transform_xml_to_tsv(sample_xml_file, output_dir)
+    transformer.transform_xml_to_tsv(sample_xml_file, output_dir, profile="full")
 
     # 2. Initialize
     db_adapter.initialize_schema(mode='full')
@@ -268,7 +268,7 @@ def test_evidence_data_is_transformed_and_loaded(sample_xml_with_evidence_file: 
         assert evidence_item["tag"] == "evidence"
         assert evidence_item["attributes"]["key"] == "1"
         assert evidence_item["attributes"]["type"] == "ECO:0000269"
-        assert evidence_item["children"][0]["attributes"]["type"] == "PubMed"
+        assert evidence_item["children"][0]['children'][0]["attributes"]["type"] == "PubMed"
 
 
 def test_delta_load_pipeline(sample_xml_file: Path, sample_xml_v2_file: Path, db_adapter: PostgresAdapter, tmp_path: Path):
@@ -282,7 +282,7 @@ def test_delta_load_pipeline(sample_xml_file: Path, sample_xml_v2_file: Path, db
 
     # --- Act 1: Initial Full Load (V1) ---
     print("--- Running Initial Full Load (V1) ---")
-    transformer.transform_xml_to_tsv(sample_xml_file, output_dir_v1)
+    transformer.transform_xml_to_tsv(sample_xml_file, output_dir_v1, profile="full")
     db_adapter.initialize_schema(mode='full')
     for table_name in TABLE_LOAD_ORDER:
         file_path = output_dir_v1 / f"{table_name}.tsv.gz"
@@ -303,7 +303,7 @@ def test_delta_load_pipeline(sample_xml_file: Path, sample_xml_v2_file: Path, db
 
     # --- Act 2: Delta Load (V2) ---
     print("--- Running Delta Load (V2) ---")
-    transformer.transform_xml_to_tsv(sample_xml_v2_file, output_dir_v2)
+    transformer.transform_xml_to_tsv(sample_xml_v2_file, output_dir_v2, profile="full")
     db_adapter.initialize_schema(mode='delta') # Re-initialize STAGING schema
     for table_name in TABLE_LOAD_ORDER:
         file_path = output_dir_v2 / f"{table_name}.tsv.gz"
@@ -355,7 +355,7 @@ def test_status_command_reporting(db_adapter: PostgresAdapter, sample_xml_file: 
         "swissprot_entry_count": 1,
         "trembl_entry_count": 1,
     }
-    transformer.transform_xml_to_tsv(sample_xml_file, output_dir)
+    transformer.transform_xml_to_tsv(sample_xml_file, output_dir, profile="full")
     db_adapter.initialize_schema(mode='full')
     for table_name in TABLE_LOAD_ORDER:
         file_path = output_dir / f"{table_name}.tsv.gz"
@@ -428,7 +428,13 @@ def test_cli_full_load_with_yaml_config(postgres_container: PostgresContainer, s
 
     # 2. Check database state
     prod_schema = "uniprot_public" # Default production schema
-    with psycopg2.connect(db_url) as conn, conn.cursor() as cur:
+    with psycopg2.connect(
+        host=postgres_container.get_container_host_ip(),
+        port=int(postgres_container.get_exposed_port(5432)),
+        user=postgres_container.username,
+        password=postgres_container.password,
+        dbname=postgres_container.dbname,
+    ) as conn, conn.cursor() as cur:
         # Check that the production schema exists and staging is gone
         cur.execute("SELECT 1 FROM pg_namespace WHERE nspname = %s", (prod_schema,))
         assert cur.fetchone() is not None, "Production schema should exist"

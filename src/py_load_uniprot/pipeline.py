@@ -8,6 +8,7 @@ from rich import print
 from rich.markup import escape
 import uuid
 import traceback
+import datetime
 
 from py_load_uniprot import extractor, transformer
 from py_load_uniprot.config import get_settings
@@ -40,6 +41,7 @@ class PyLoadUniprotPipeline:
             Exception: Propagates exceptions from underlying ETL steps after logging.
         """
         run_id = str(uuid.uuid4())
+        start_time = datetime.datetime.now()
         print(f"[bold blue]Starting ETL pipeline run (ID: {run_id})...[/bold blue]")
         print(f"Dataset: [cyan]{dataset}[/cyan], Mode: [cyan]{mode}[/cyan]")
 
@@ -50,9 +52,6 @@ class PyLoadUniprotPipeline:
             valid_datasets = ['swissprot', 'trembl', 'all']
             if dataset not in valid_datasets:
                 raise ValueError(f"Dataset '{dataset}' is not valid. Choose from {valid_datasets}.")
-
-            # Log the start of the run
-            self.db_adapter.log_run_start(run_id, mode, dataset)
 
             datasets_to_process = ['swissprot', 'trembl'] if dataset == 'all' else [dataset]
 
@@ -82,15 +81,17 @@ class PyLoadUniprotPipeline:
             print("[green]Metadata update complete.[/green]")
 
             # If we reach here, the pipeline was successful
-            self.db_adapter.log_run_end(run_id, "COMPLETED")
+            end_time = datetime.datetime.now()
+            self.db_adapter.log_run(run_id, mode, dataset, "COMPLETED", start_time, end_time)
             print("\n[bold green]ETL pipeline completed successfully![/bold green]")
 
         except Exception as e:
             # Capture the full error traceback for detailed logging
+            end_time = datetime.datetime.now()
             error_msg = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
             print(f"[bold red]\nETL pipeline failed: {escape(error_msg)}[/bold red]")
             # Log the failure and then re-raise the exception
-            self.db_adapter.log_run_end(run_id, "FAILED", error_message=error_msg)
+            self.db_adapter.log_run(run_id, mode, dataset, "FAILED", start_time, end_time, error_message=error_msg)
             raise
 
     def _transform_and_load_single_dataset(self, dataset: str):

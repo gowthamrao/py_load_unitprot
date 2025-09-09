@@ -15,7 +15,7 @@ Nested keys are separated by double underscores, e.g., PY_LOAD_UNIPROT_DB__HOST.
 """
 
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Literal
 
 import yaml
 from pydantic import BaseModel, Field
@@ -30,6 +30,11 @@ class DBSettings(BaseModel):
     user: str = "postgres"
     password: str = "password"
     dbname: str = "uniprot"
+
+    @property
+    def connection_string(self) -> str:
+        """Generates a psycopg2-compatible connection string."""
+        return f"dbname='{self.dbname}' user='{self.user}' host='{self.host}' port='{self.port}' password='{self.password}'"
 
 
 class URLSettings(BaseModel):
@@ -56,6 +61,10 @@ class Settings(BaseSettings):
     """
     Main configuration class for the application.
     """
+    profile: Literal["full", "standard"] = Field(
+        default="full",
+        description="The data extraction profile to use ('full' or 'standard')."
+    )
     data_dir: Path = Field(default="data", description="Directory to store downloaded UniProt files.")
     db: DBSettings = Field(default_factory=DBSettings)
     urls: URLSettings = Field(default_factory=URLSettings)

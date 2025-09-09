@@ -20,7 +20,7 @@ def postgres_connection():
     settings = get_settings()
     conn = None
     try:
-        conn = psycopg2.connect(settings.db_connection_string)
+        conn = psycopg2.connect(settings.db.connection_string)
         yield conn
     except psycopg2.OperationalError as e:
         print(f"[bold red]Database connection error: {e}[/bold red]")
@@ -97,8 +97,6 @@ class PostgresAdapter(DatabaseAdapter):
         # Same as before, but good to have it defined once
         return f"""
         CREATE SCHEMA IF NOT EXISTS {self.staging_schema};
-        CREATE TABLE IF NOT EXISTS {self.staging_schema}.py_load_uniprot_metadata ( release_version VARCHAR(255) PRIMARY KEY, release_date DATE, load_timestamp TIMESTAMPTZ DEFAULT NOW(), swissprot_entry_count INTEGER, trembl_entry_count INTEGER );
-        CREATE TABLE IF NOT EXISTS {self.staging_schema}.load_history ( id SERIAL PRIMARY KEY, run_id VARCHAR(36), status VARCHAR(50), mode VARCHAR(50), dataset VARCHAR(50), start_time TIMESTAMPTZ, end_time TIMESTAMPTZ, error_message TEXT );
         CREATE TABLE IF NOT EXISTS {self.staging_schema}.proteins ( primary_accession VARCHAR(255) PRIMARY KEY, uniprot_id VARCHAR(255), sequence_length INTEGER, molecular_weight INTEGER, created_date DATE, modified_date DATE, comments_data JSONB, features_data JSONB, db_references_data JSONB, evidence_data JSONB );
         CREATE TABLE IF NOT EXISTS {self.staging_schema}.sequences ( primary_accession VARCHAR(255) PRIMARY KEY, sequence TEXT, FOREIGN KEY (primary_accession) REFERENCES {self.staging_schema}.proteins(primary_accession) ON DELETE CASCADE );
         CREATE TABLE IF NOT EXISTS {self.staging_schema}.accessions ( protein_accession VARCHAR(255), secondary_accession VARCHAR(255), PRIMARY KEY (protein_accession, secondary_accession), FOREIGN KEY (protein_accession) REFERENCES {self.staging_schema}.proteins(primary_accession) ON DELETE CASCADE );
@@ -205,6 +203,8 @@ class PostgresAdapter(DatabaseAdapter):
 
             print(f"Activating new schema by renaming '{self.staging_schema}' to '{self.production_schema}'...")
             cur.execute(f"ALTER SCHEMA {self.staging_schema} RENAME TO {self.production_schema};")
+            # Now that the new production schema is live, create the metadata tables in it
+            self._create_metadata_tables(cur)
             conn.commit()
         print(f"[bold green]Schema swap complete. '{self.production_schema}' is now live.[/bold green]")
 
@@ -216,6 +216,30 @@ class PostgresAdapter(DatabaseAdapter):
             conn.commit()
         print("[bold green]Delta load complete.[/bold green]")
 
+    def _create_metadata_tables(self, cur) -> None:
+        """Creates the metadata tables in the production schema."""
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {self.production_schema}.py_load_uniprot_metadata (
+                release_version VARCHAR(255) PRIMARY KEY,
+                release_date DATE,
+                load_timestamp TIMESTAMPTZ DEFAULT NOW(),
+                swissprot_entry_count INTEGER,
+                trembl_entry_count INTEGER
+            );
+        """)
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {self.production_schema}.load_history (
+                id SERIAL PRIMARY KEY,
+                run_id VARCHAR(36),
+                status VARCHAR(50),
+                mode VARCHAR(50),
+                dataset VARCHAR(50),
+                start_time TIMESTAMPTZ,
+                end_time TIMESTAMPTZ,
+                error_message TEXT
+            );
+        """)
+
     def _create_production_schema_if_not_exists(self, cur) -> None:
         """Creates the production schema and its tables if they don't exist."""
         print(f"Ensuring production schema '{self.production_schema}' exists...")
@@ -223,6 +247,7 @@ class PostgresAdapter(DatabaseAdapter):
         # Swap out the schema name to create the production tables
         production_ddl = self._get_schema_ddl().replace(self.staging_schema, self.production_schema)
         cur.execute(production_ddl)
+        self._create_metadata_tables(cur)
         print("Production schema is ready.")
 
     def _execute_delta_update(self, cur) -> None:
@@ -415,7 +440,8 @@ class PostgresAdapter(DatabaseAdapter):
         Updates the corresponding run record in load_history with the final
         status and end time.
         """
-        print(f"Logging pipeline run end for run_id: [cyan]{run_id}[/cyan] with status [bold { 'green' if status == 'COMPLETED' else 'red' }]{status}[/bold]")
+        color = "green" if status == "COMPLETED" else "red"
+        print(f"Logging pipeline run end for run_id: [cyan]{run_id}[/cyan] with status [{color}][bold]{status}[/bold][/{color}]")
         sql = f"""
         UPDATE {self.production_schema}.load_history
         SET status = %(status)s,

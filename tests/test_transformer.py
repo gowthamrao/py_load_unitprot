@@ -68,7 +68,7 @@ def test_transform_xml_to_tsv_creates_correct_output(sample_xml_file: Path, tmp_
     output_dir = tmp_path / "output"
 
     # Act
-    transformer.transform_xml_to_tsv(sample_xml_file, output_dir)
+    transformer.transform_xml_to_tsv(sample_xml_file, output_dir, profile="full")
 
     # Assert all expected files are created
     for table_name in transformer.TABLE_HEADERS.keys():
@@ -165,7 +165,7 @@ def test_parse_entry_extracts_evidence_data():
     elem = etree.fromstring(xml_string)
 
     # Act
-    parsed_data = transformer._parse_entry(elem)
+    parsed_data = transformer._parse_entry(elem, profile="full")
 
     # Assert
     assert "proteins" in parsed_data
@@ -195,7 +195,7 @@ def test_parse_entry_extracts_evidence_data():
 
 # --- Test for parallel implementation ---
 
-def transform_xml_to_tsv_single_threaded(xml_file: Path, output_dir: Path):
+def transform_xml_to_tsv_single_threaded(xml_file: Path, output_dir: Path, profile: str):
     """
     A single-threaded version of the transformer, kept for baseline comparison.
     """
@@ -207,7 +207,7 @@ def transform_xml_to_tsv_single_threaded(xml_file: Path, output_dir: Path):
         seen_taxonomy_ids = set()
 
         for _, elem in context:
-            parsed_data = transformer._parse_entry(elem)
+            parsed_data = transformer._parse_entry(elem, profile)
 
             for table_name, rows in parsed_data.items():
                 if table_name == "taxonomy":
@@ -239,9 +239,9 @@ def test_parallel_transformer_matches_single_threaded(sample_xml_file: Path, tmp
 
     # Act
     # Run single-threaded version
-    transform_xml_to_tsv_single_threaded(sample_xml_file, output_single)
+    transform_xml_to_tsv_single_threaded(sample_xml_file, output_single, profile="full")
     # Run parallel version
-    transformer.transform_xml_to_tsv(sample_xml_file, output_parallel, num_workers=2)
+    transformer.transform_xml_to_tsv(sample_xml_file, output_parallel, profile="full", num_workers=2)
 
     # Assert
     # Check that the same files were created

@@ -164,6 +164,11 @@ class PyLoadUniprotPipeline:
                 error_message=error_msg,
             )
             raise
+        finally:
+            # Final cleanup step to ensure the staging schema is always removed
+            print("\n[bold]Step 7: Cleaning up resources...[/bold]")
+            self.db_adapter.cleanup()
+            print("[green]Resource cleanup complete.[/green]")
 
     def _transform_and_load_single_dataset(self, dataset: str) -> None:
         """

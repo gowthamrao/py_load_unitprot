@@ -7,11 +7,10 @@ import pytest
 from testcontainers.postgres import PostgresContainer
 from typer.testing import CliRunner
 
-from py_load_uniprot import PyLoadUniprotPipeline, extractor, transformer
+from py_load_uniprot import PyLoadUniprotPipeline, extractor
 from py_load_uniprot.cli import app
 from py_load_uniprot.config import Settings, load_settings
 from py_load_uniprot.db_manager import (
-    TABLE_LOAD_ORDER,
     PostgresAdapter,
     postgres_connection,
 )

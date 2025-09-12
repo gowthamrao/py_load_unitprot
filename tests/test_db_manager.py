@@ -1,5 +1,3 @@
-import gzip
-import importlib.resources
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch

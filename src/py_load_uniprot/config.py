@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 import yaml
 from pydantic import BaseModel, Field
@@ -68,7 +68,7 @@ def load_settings(config_file: Optional[Path] = None) -> Settings:
     Raises:
         FileNotFoundError: If the specified config_file does not exist.
     """
-    init_kwargs = {}
+    init_kwargs: dict[str, Any] = {}
     if config_file:
         if not config_file.is_file():
             raise FileNotFoundError(f"Configuration file not found: {config_file}")

@@ -37,6 +37,7 @@ class Settings(BaseSettings):
 
     profile: Literal["full", "standard"] = "full"
     data_dir: Path = Path("data")
+    num_workers: Optional[int] = None
     db: DBSettings = Field(default_factory=DBSettings)
     urls: URLSettings = Field(default_factory=URLSettings)
 

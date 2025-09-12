@@ -189,7 +189,10 @@ class PyLoadUniprotPipeline:
             temp_dir = Path(tempfile.mkdtemp(prefix=f"uniprot_{dataset}_"))
             print(f"    Intermediate files will be stored in: {temp_dir}")
             transformer.transform_xml_to_tsv(
-                source_xml_path, temp_dir, self.settings.profile
+                source_xml_path,
+                temp_dir,
+                self.settings.profile,
+                num_workers=self.settings.num_workers,
             )
             print(f"  - Transformation complete for {dataset}.")
 

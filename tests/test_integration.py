@@ -1007,13 +1007,15 @@ def test_pipeline_handles_duplicate_accessions_in_source(
     assert "Found 1 duplicate primary accessions" in caplog.text
     assert "P12345" in caplog.text
 
-    # 2. Check that only one of the proteins was loaded
+    # 2. Check that only one of the proteins was loaded and it's the first one.
     with postgres_connection(settings) as conn, conn.cursor() as cur:
         prod_schema = pipeline.db_adapter.production_schema
         cur.execute(
-            f"SELECT COUNT(*) FROM {prod_schema}.proteins WHERE primary_accession = 'P12345'"
+            f"SELECT uniprot_id FROM {prod_schema}.proteins WHERE primary_accession = 'P12345'"
         )
-        assert cur.fetchone()[0] == 1, "Only one protein with accession P12345 should be loaded"
+        result = cur.fetchall()
+        assert len(result) == 1, "Only one protein with accession P12345 should be loaded"
+        assert result[0][0] == "TEST1_HUMAN_V1", "The first seen duplicate entry should be the one loaded"
 
 
 def test_delta_load_primary_accession_change(
@@ -1168,3 +1170,199 @@ def test_full_load_rolls_back_on_data_load_failure(
         assert (
             cur.fetchone() is None
         ), "Production schema should not be created on failure"
+
+
+@pytest.fixture
+def sample_xml_empty_file(tmp_path: Path) -> Path:
+    """Creates a gzipped, completely empty file."""
+    xml_path = tmp_path / "sample_empty.xml.gz"
+    with gzip.open(xml_path, "wt", encoding="utf-8") as f:
+        f.write("")
+    return xml_path
+
+
+@pytest.fixture
+def sample_xml_no_entries_file(tmp_path: Path) -> Path:
+    """Creates a gzipped XML file with a root element but no entries."""
+    xml_path = tmp_path / "sample_no_entries.xml.gz"
+    with gzip.open(xml_path, "wt", encoding="utf-8") as f:
+        f.write('<?xml version="1.0" encoding="UTF-8"?><uniprot xmlns="http://uniprot.org/uniprot"></uniprot>')
+    return xml_path
+
+
+@pytest.mark.parametrize(
+    "xml_file_fixture", ["sample_xml_empty_file", "sample_xml_no_entries_file"]
+)
+def test_pipeline_handles_empty_or_no_entry_files(
+    settings: Settings,
+    db_adapter: PostgresAdapter,
+    xml_file_fixture: str,
+    request,
+    mocker,
+):
+    """
+    Tests that the pipeline runs successfully without errors when the input
+    XML file is empty or contains no <entry> elements.
+    """
+    # --- Arrange ---
+    xml_file = request.getfixturevalue(xml_file_fixture)
+    settings.data_dir = xml_file.parent
+    sprot_file = settings.data_dir / "uniprot_sprot.xml.gz"
+    xml_file.rename(sprot_file)
+
+    mocker.patch.object(
+        extractor.Extractor,
+        "get_release_info",
+        return_value={
+            "version": "EMPTY_TEST",
+            "release_date": datetime.date(2025, 1, 1),
+            "swissprot_entry_count": 0,
+            "trembl_entry_count": 0,
+        },
+    )
+
+    pipeline = PyLoadUniprotPipeline(settings)
+    pipeline.db_adapter.production_schema = "test_empty_file"
+    pipeline.db_adapter.staging_schema = "test_empty_file_staging"
+
+    # --- Act ---
+    # The pipeline should run to completion without raising an exception
+    pipeline.run(dataset="swissprot", mode="full")
+
+    # --- Assert ---
+    with postgres_connection(settings) as conn, conn.cursor() as cur:
+        prod_schema = pipeline.db_adapter.production_schema
+        # Check that the production schema and metadata table were created
+        cur.execute("SELECT 1 FROM pg_namespace WHERE nspname = %s", (prod_schema,))
+        assert cur.fetchone() is not None, "Production schema should still be created"
+
+        # Check that no proteins were loaded
+        cur.execute(f"SELECT COUNT(*) FROM {prod_schema}.proteins")
+        assert cur.fetchone()[0] == 0, "Should be zero proteins loaded"
+
+        # Check that metadata was still written
+        cur.execute(f"SELECT version FROM {prod_schema}.py_load_uniprot_metadata")
+        assert cur.fetchone()[0] == "EMPTY_TEST", "Metadata should be written"
+
+
+@pytest.fixture(scope="session")
+def sample_xml_full_profile_content():
+    """
+    A comprehensive XML entry designed to test the differences between
+    'standard' and 'full' ETL profiles.
+    """
+    return """<?xml version="1.0" encoding="UTF-8"?>
+<uniprot xmlns="http://uniprot.org/uniprot">
+<entry dataset="Swiss-Prot" created="2022-01-01" modified="2022-01-01" version="1">
+  <accession>F00001</accession>
+  <name>FULL_PROFILE_TEST</name>
+  <protein><recommendedName><fullName>Full Profile Test Protein</fullName></recommendedName></protein>
+  <organism>
+    <name type="scientific">Test organism</name>
+    <dbReference type="NCBI Taxonomy" id="99999"/>
+  </organism>
+  <!-- Comments: one 'standard' type, one 'non-standard' type -->
+  <comment type="function"><text>This is a function comment (standard).</text></comment>
+  <comment type="miscellaneous"><text>This is a miscellaneous comment (full only).</text></comment>
+  <!-- Feature: should only be loaded in 'full' profile -->
+  <feature type="active site"><location><position position="10"/></location></feature>
+  <!-- DB Reference: should only be loaded in 'full' profile -->
+  <dbReference type="PDB" id="1XYZ"/>
+  <!-- Evidence: should only be loaded in 'full' profile -->
+  <evidence key="1" type="ECO:0000256"/>
+  <sequence length="20" mass="2222">FULLPROFILESEQTESTAA</sequence>
+</entry>
+</uniprot>
+"""
+
+
+@pytest.fixture
+def sample_xml_full_profile_file(tmp_path: Path, sample_xml_full_profile_content: str) -> Path:
+    """Creates a gzipped sample XML file for testing ETL profiles."""
+    xml_path = tmp_path / "sample_full_profile.xml.gz"
+    with gzip.open(xml_path, "wt", encoding="utf-8") as f:
+        f.write(sample_xml_full_profile_content)
+    return xml_path
+
+
+def test_etl_profiles_standard_vs_full(
+    settings: Settings,
+    db_adapter: PostgresAdapter,
+    sample_xml_full_profile_file: Path,
+    mocker,
+):
+    """
+    Tests that the 'standard' and 'full' ETL profiles correctly include or
+    exclude detailed JSONB data.
+    """
+    # --- Arrange ---
+    settings.data_dir = sample_xml_full_profile_file.parent
+    sprot_file = settings.data_dir / "uniprot_sprot.xml.gz"
+    sample_xml_full_profile_file.rename(sprot_file)
+
+    mocker.patch.object(
+        extractor.Extractor,
+        "get_release_info",
+        return_value={
+            "version": "PROFILE_TEST",
+            "release_date": datetime.date(2025, 1, 1),
+            "swissprot_entry_count": 1,
+            "trembl_entry_count": 0,
+        },
+    )
+
+    # --- Act 1: Run with 'standard' profile (default) ---
+    print("--- Running pipeline with 'standard' profile ---")
+    # --- Act 1: Run with 'standard' profile (default) ---
+    print("--- Running pipeline with 'standard' profile ---")
+    settings.profile = "standard"  # Explicitly set profile on settings
+    pipeline_standard = PyLoadUniprotPipeline(settings)
+    pipeline_standard.db_adapter.production_schema = "test_profiles_standard"
+    pipeline_standard.db_adapter.staging_schema = "test_profiles_standard_staging"
+    pipeline_standard.run(dataset="swissprot", mode="full")
+
+    # --- Assert 1: Check 'standard' profile results ---
+    with postgres_connection(settings) as conn, conn.cursor() as cur:
+        prod_schema = pipeline_standard.db_adapter.production_schema
+        cur.execute(
+            f"SELECT comments_data, features_data, db_references_data, evidence_data FROM {prod_schema}.proteins WHERE primary_accession = 'F00001'"
+        )
+        row = cur.fetchone()
+        assert row is not None, "Protein should be loaded in standard profile"
+        comments, features, db_refs, evidence = row
+
+        # Comments should be filtered to standard types
+        assert comments is not None and len(comments) == 1
+        assert comments[0]["attributes"]["type"] == "function"
+        # The other JSON fields should be NULL (or empty JSON)
+        assert features is None, "Features should be NULL in standard profile"
+        assert db_refs is None, "DB References should be NULL in standard profile"
+        assert evidence is None, "Evidence should be NULL in standard profile"
+
+    # --- Act 2: Run with 'full' profile ---
+    print("--- Running pipeline with 'full' profile ---")
+    settings.profile = "full"  # Switch profile on the same settings object
+    pipeline_full = PyLoadUniprotPipeline(settings)
+    # Use a new adapter and different schema names to avoid conflicts
+    pipeline_full.db_adapter = PostgresAdapter(
+        settings,
+        staging_schema="test_profiles_full_staging",
+        production_schema="test_profiles_full",
+    )
+    pipeline_full.run(dataset="swissprot", mode="full")
+
+    # --- Assert 2: Check 'full' profile results ---
+    with postgres_connection(settings) as conn, conn.cursor() as cur:
+        prod_schema = pipeline_full.db_adapter.production_schema
+        cur.execute(
+            f"SELECT comments_data, features_data, db_references_data, evidence_data FROM {prod_schema}.proteins WHERE primary_accession = 'F00001'"
+        )
+        row = cur.fetchone()
+        assert row is not None, "Protein should be loaded in full profile"
+        comments, features, db_refs, evidence = row
+
+        # All data should be present
+        assert comments is not None and len(comments) == 2, "Should have all comments"
+        assert features is not None and len(features) > 0, "Features should be loaded"
+        assert db_refs is not None and len(db_refs) > 0, "DB References should be loaded"
+        assert evidence is not None and len(evidence) > 0, "Evidence should be loaded"

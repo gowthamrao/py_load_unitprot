@@ -329,6 +329,12 @@ def _get_total_entries(xml_file: Path) -> int:
     print("Counting total entries for progress tracking...")
     count = 0
     with gzip.open(xml_file, "rb") as f:
+        # Handle empty file case before parsing
+        if not f.read(1):
+            print("[yellow]Warning: XML file is empty. Assuming 0 entries.[/yellow]")
+            return 0
+        f.seek(0)
+
         # Use iterparse on a non-blocking fast event to count entries
         for _, elem in etree.iterparse(f, events=("end",), tag=_get_tag("entry")):
             count += 1

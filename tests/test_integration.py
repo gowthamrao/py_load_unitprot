@@ -633,3 +633,125 @@ def test_full_etl_pipeline_with_generated_data(
         result = cur.fetchone()
         assert result is not None, "Protein P12345 should have a result for ncbi_taxid"
         assert result[0] == 9986, "Protein P12345 should be linked to taxonomy 9986"
+
+
+# V3: P12345's primary accession is changed to A1B2C3
+SAMPLE_XML_V3_CONTENT = """<?xml version="1.0" encoding="UTF-8"?>
+<uniprot xmlns="http://uniprot.org/uniprot">
+<entry dataset="Swiss-Prot" created="2000-05-30" modified="2025-02-01" version="152">
+  <accession>A1B2C3</accession>
+  <accession>P12345</accession>
+  <accession>Q9Y5Y5</accession>
+  <name>TEST1_HUMAN</name>
+  <protein>
+    <recommendedName><fullName>Test protein 1 - Accession Change</fullName></recommendedName>
+  </protein>
+  <sequence length="10" mass="1111">MTESTSEQAA</sequence>
+</entry>
+</uniprot>
+"""
+
+
+@pytest.fixture
+def sample_xml_v3_file(tmp_path: Path) -> Path:
+    """Creates a gzipped sample V3 XML file for delta load testing (accession change)."""
+    xml_path = tmp_path / "sample_v3.xml.gz"
+    with gzip.open(xml_path, "wt", encoding="utf-8") as f:
+        f.write(SAMPLE_XML_V3_CONTENT)
+    return xml_path
+
+
+def test_delta_load_primary_accession_change(
+    settings: Settings, sample_xml_file: Path, sample_xml_v3_file: Path, mocker
+):
+    """
+    Tests that a delta load correctly handles a change in a protein's
+    primary accession number, which is a critical edge case for maintaining
+    data integrity.
+    """
+    # --- Arrange ---
+    settings.data_dir = sample_xml_file.parent
+    sprot_file = settings.data_dir / "uniprot_sprot.xml.gz"
+    sample_xml_file.rename(sprot_file)
+    pipeline = PyLoadUniprotPipeline(settings)
+
+    # --- Act 1: Initial Full Load (V1) ---
+    print("--- Running Initial Full Load (V1) for Accession Change Test ---")
+    mocker.patch.object(
+        extractor.Extractor,
+        "get_release_info",
+        return_value={
+            "version": "V1_ACC_TEST",
+            "release_date": datetime.date(2024, 1, 1),
+            "swissprot_entry_count": 2,
+            "trembl_entry_count": 0,
+        },
+    )
+    pipeline.run(dataset="swissprot", mode="full")
+
+    # --- Assert 1: Verify initial state ---
+    with postgres_connection(settings) as conn, conn.cursor() as cur:
+        cur.execute(
+            f"SELECT 1 FROM {pipeline.db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'"
+        )
+        assert cur.fetchone() is not None, "Protein P12345 should exist after full load"
+        cur.execute(
+            f"SELECT 1 FROM {pipeline.db_adapter.production_schema}.proteins WHERE primary_accession = 'A1B2C3'"
+        )
+        assert cur.fetchone() is None, "Protein A1B2C3 should not exist yet"
+
+    # --- Act 2: Delta Load (V3) ---
+    print("--- Running Delta Load (V3) for Accession Change ---")
+    sprot_file.rename(settings.data_dir / "uniprot_sprot_v1.xml.gz")
+    sample_xml_v3_file.rename(sprot_file)
+    mocker.patch.object(
+        extractor.Extractor,
+        "get_release_info",
+        return_value={
+            "version": "V3_ACC_TEST",
+            "release_date": datetime.date(2025, 2, 1),
+            "swissprot_entry_count": 1,
+            "trembl_entry_count": 0,
+        },
+    )
+    pipeline.run(dataset="swissprot", mode="delta")
+
+    # --- Assert 2: Verify state after delta load ---
+    with postgres_connection(settings) as conn, conn.cursor() as cur:
+        # The old primary accession should be gone
+        cur.execute(
+            f"SELECT 1 FROM {pipeline.db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'"
+        )
+        assert (
+            cur.fetchone() is None
+        ), "Old primary accession P12345 should be deleted"
+
+        # The new primary accession should exist
+        cur.execute(
+            f"SELECT uniprot_id FROM {pipeline.db_adapter.production_schema}.proteins WHERE primary_accession = 'A1B2C3'"
+        )
+        result = cur.fetchone()
+        assert (
+            result is not None
+        ), "New primary accession A1B2C3 should be inserted"
+        assert (
+            result[0] == "TEST1_HUMAN"
+        ), "Uniprot ID should remain the same for the new accession"
+
+        # Check that the old accession is now a secondary accession for the new primary one
+        cur.execute(
+            f"SELECT 1 FROM {pipeline.db_adapter.production_schema}.accessions WHERE protein_accession = 'A1B2C3' AND secondary_accession = 'P12345'"
+        )
+        assert (
+            cur.fetchone() is not None
+        ), "P12345 should now be a secondary accession for A1B2C3"
+
+        # Check that other proteins (like P67890) from the initial load were correctly deleted as they were not in the V3 file
+        cur.execute(
+            f"SELECT 1 FROM {pipeline.db_adapter.production_schema}.proteins WHERE primary_accession = 'P67890'"
+        )
+        assert cur.fetchone() is None, "P67890 should have been deleted"
+
+        # The total count should be 1 (only A1B2C3)
+        cur.execute(f"SELECT COUNT(*) FROM {pipeline.db_adapter.production_schema}.proteins")
+        assert cur.fetchone()[0] == 1, "Only the updated protein should exist"

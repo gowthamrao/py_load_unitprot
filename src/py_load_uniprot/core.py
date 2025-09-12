@@ -164,6 +164,11 @@ class PyLoadUniprotPipeline:
                 error_message=error_msg,
             )
             raise
+        finally:
+            # This block will always execute, ensuring cleanup happens
+            # even if the pipeline fails.
+            print("\n[bold]Executing final cleanup...[/bold]")
+            self.db_adapter.cleanup_staging_schema()
 
     def _transform_and_load_single_dataset(self, dataset: str) -> None:
         """

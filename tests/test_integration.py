@@ -79,19 +79,42 @@ def sample_xml_file(tmp_path: Path, sample_xml_content: str) -> Path:
     return xml_path
 
 
+from typing import Iterator
+
 @pytest.fixture
-def settings(postgres_container: PostgresContainer) -> Settings:
+def settings(postgres_container: PostgresContainer) -> Iterator[Settings]:
     """
     Provides a Settings object configured to use the test container.
+    This fixture now also handles cleanup of default schemas after each test.
     """
-    # Use load_settings which initializes a new object each time
-    settings = load_settings()
-    settings.db.host = postgres_container.get_container_host_ip()
-    settings.db.port = int(postgres_container.get_exposed_port(5432))
-    settings.db.user = postgres_container.username
-    settings.db.password = postgres_container.password
-    settings.db.dbname = postgres_container.dbname
-    return settings
+    s = load_settings()
+    s.db.host = postgres_container.get_container_host_ip()
+    s.db.port = int(postgres_container.get_exposed_port(5432))
+    s.db.user = postgres_container.username
+    s.db.password = postgres_container.password
+    s.db.dbname = postgres_container.dbname
+
+    yield s
+
+    # Teardown: clean up default schemas to ensure test isolation
+    print("Tearing down default schemas...")
+    prod_schema = "uniprot_public"
+    staging_schema = "uniprot_staging"
+    try:
+        with psycopg2.connect(s.db.connection_string) as conn, conn.cursor() as cur:
+            cur.execute(f"DROP SCHEMA IF EXISTS {prod_schema} CASCADE;")
+            cur.execute(f"DROP SCHEMA IF EXISTS {staging_schema} CASCADE;")
+            # Drop any archived schemas left over from full loads
+            cur.execute(
+                "SELECT nspname FROM pg_namespace WHERE nspname LIKE %s;",
+                (f"{prod_schema}_old_%",),
+            )
+            for row in cur.fetchall():
+                cur.execute(f"DROP SCHEMA IF EXISTS {row[0]} CASCADE;")
+            conn.commit()
+        print("Default schemas torn down successfully.")
+    except psycopg2.Error as e:
+        print(f"Error during default schema teardown: {e}")
 
 
 @pytest.fixture
@@ -634,3 +657,69 @@ def test_full_etl_pipeline_with_generated_data(
         result = cur.fetchone()
         assert result is not None, "Protein P12345 should have a result for ncbi_taxid"
         assert result[0] == 9986, "Protein P12345 should be linked to taxonomy 9986"
+
+
+def test_full_load_failure_and_rollback(
+    settings: Settings, sample_xml_file: Path, mocker
+):
+    """
+    Tests that if the pipeline fails during a full load, the transaction
+    is rolled back and the staging schema is cleaned up.
+    """
+    # --- Arrange ---
+    settings.data_dir = sample_xml_file.parent
+    sprot_file = settings.data_dir / "uniprot_sprot.xml.gz"
+    sample_xml_file.rename(sprot_file)
+
+    mocker.patch.object(
+        extractor.Extractor,
+        "get_release_info",
+        return_value={
+            "version": "FAILURE_TEST",
+            "release_date": datetime.date(2025, 1, 1),
+            "swissprot_entry_count": 1,
+            "trembl_entry_count": 0,
+        },
+    )
+
+    # Mock the _direct_copy_load method to fail on the second call (for the 'proteins' table)
+    copy_mock = mocker.patch(
+        "py_load_uniprot.db_manager.PostgresAdapter._direct_copy_load",
+        side_effect=[
+            None,  # First call (taxonomy) succeeds
+            psycopg2.OperationalError("Simulated database connection failure!"),
+            None,  # Allow subsequent calls to succeed if any
+        ],
+    )
+
+    pipeline = PyLoadUniprotPipeline(settings)
+
+    # --- Act & Assert ---
+    # The pipeline should raise the exception from the mock
+    with pytest.raises(
+        psycopg2.OperationalError, match="Simulated database connection failure"
+    ):
+        pipeline.run(dataset="swissprot", mode="full")
+
+    # --- Assert Cleanup ---
+    # After the failure, the staging schema should have been dropped
+    assert copy_mock.call_count == 2, "COPY should have been attempted twice"
+
+    with postgres_connection(settings) as conn, conn.cursor() as cur:
+        # Check that the staging schema is gone
+        cur.execute(
+            "SELECT 1 FROM pg_namespace WHERE nspname = %s",
+            (pipeline.db_adapter.staging_schema,),
+        )
+        assert (
+            cur.fetchone() is None
+        ), "Staging schema should be dropped after a failure"
+
+        # Check that the production schema was not created or affected
+        cur.execute(
+            "SELECT 1 FROM pg_namespace WHERE nspname = %s",
+            (pipeline.db_adapter.production_schema,),
+        )
+        assert (
+            cur.fetchone() is None
+        ), "Production schema should not exist after a failed initial load"

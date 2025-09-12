@@ -95,6 +95,11 @@ class DatabaseAdapter(ABC):
         """Logs a pipeline run to the history table."""
         pass
 
+    @abstractmethod
+    def cleanup_staging_schema(self) -> None:
+        """Removes the staging schema, typically after a failure."""
+        pass
+
 
 class PostgresAdapter(DatabaseAdapter):
     def __init__(
@@ -506,8 +511,6 @@ class PostgresAdapter(DatabaseAdapter):
         """
         try:
             with postgres_connection(self.settings) as conn, conn.cursor() as cur:
-                # Ensure the production schema and table exist before logging
-                self._create_production_schema_if_not_exists(cur)
                 cur.execute(
                     sql,
                     {
@@ -523,3 +526,19 @@ class PostgresAdapter(DatabaseAdapter):
                 conn.commit()
         except Exception as e:
             print(f"[bold red]Failed to log pipeline run: {e}[/bold red]")
+
+    def cleanup_staging_schema(self) -> None:
+        """
+        Connects to the database and drops the staging schema if it exists.
+        This is a standalone cleanup utility.
+        """
+        print(f"Executing cleanup: dropping staging schema '{self.staging_schema}'...")
+        try:
+            with postgres_connection(self.settings) as conn, conn.cursor() as cur:
+                cur.execute(f"DROP SCHEMA IF EXISTS {self.staging_schema} CASCADE;")
+                conn.commit()
+            print("[green]Staging schema cleanup successful.[/green]")
+        except psycopg2.Error as e:
+            print(
+                f"[bold red]Error during staging schema cleanup: {e}[/bold red]"
+            )

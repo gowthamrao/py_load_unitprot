@@ -183,7 +183,7 @@ def sample_xml_v2_file(tmp_path: Path) -> Path:
 
 
 def test_full_etl_pipeline_api(
-    settings: Settings, sample_xml_file: Path, mocker
+        settings: Settings, db_adapter: PostgresAdapter, sample_xml_file: Path, mocker
 ):
     """
     Tests the full end-to-end pipeline using the new programmatic API.
@@ -210,6 +210,8 @@ def test_full_etl_pipeline_api(
     # --- Act ---
     # Initialize and run the pipeline
     pipeline = PyLoadUniprotPipeline(settings)
+    pipeline.db_adapter.production_schema = db_adapter.production_schema
+    pipeline.db_adapter.staging_schema = db_adapter.staging_schema
     pipeline.run(dataset="swissprot", mode="full")
 
     # --- Assert ---
@@ -272,7 +274,7 @@ def sample_xml_with_evidence_file(
 
 
 def test_evidence_data_is_transformed_and_loaded(
-    settings: Settings, sample_xml_with_evidence_file: Path, mocker
+    settings: Settings, db_adapter: PostgresAdapter, sample_xml_with_evidence_file: Path, mocker
 ):
     """
     Tests that evidence tags are correctly parsed and loaded via the pipeline API.
@@ -295,6 +297,8 @@ def test_evidence_data_is_transformed_and_loaded(
 
     # Act
     pipeline = PyLoadUniprotPipeline(settings)
+    pipeline.db_adapter.production_schema = db_adapter.production_schema
+    pipeline.db_adapter.staging_schema = db_adapter.staging_schema
     pipeline.run(dataset="swissprot", mode="full")
 
     # Assert
@@ -321,7 +325,7 @@ def test_evidence_data_is_transformed_and_loaded(
 
 
 def test_delta_load_pipeline(
-    settings: Settings, sample_xml_file: Path, sample_xml_v2_file: Path, mocker
+    settings: Settings, db_adapter: PostgresAdapter, sample_xml_file: Path, sample_xml_v2_file: Path, mocker
 ):
     """
     Tests the delta load functionality using the high-level pipeline API.
@@ -334,6 +338,8 @@ def test_delta_load_pipeline(
     sample_xml_file.rename(sprot_file)
 
     pipeline = PyLoadUniprotPipeline(settings)
+    pipeline.db_adapter.production_schema = db_adapter.production_schema
+    pipeline.db_adapter.staging_schema = db_adapter.staging_schema
 
     # --- Act 1: Initial Full Load (V1) ---
     print("--- Running Initial Full Load (V1) ---")
@@ -429,7 +435,7 @@ def test_delta_load_pipeline(
         assert cur.fetchone()[0] == "V2_TEST"
 
 
-def test_delta_load_version_check(settings: Settings, sample_xml_file: Path, mocker):
+def test_delta_load_version_check(settings: Settings, db_adapter: PostgresAdapter, sample_xml_file: Path, mocker):
     """
     Tests that the delta load version check correctly prevents re-runs or
     running against an older version.
@@ -439,6 +445,8 @@ def test_delta_load_version_check(settings: Settings, sample_xml_file: Path, moc
     sprot_file = settings.data_dir / "uniprot_sprot.xml.gz"
     sample_xml_file.rename(sprot_file)
     pipeline = PyLoadUniprotPipeline(settings)
+    pipeline.db_adapter.production_schema = db_adapter.production_schema
+    pipeline.db_adapter.staging_schema = db_adapter.staging_schema
 
     release_info_v1 = {
         "version": "V1_TEST",
@@ -478,7 +486,7 @@ def test_delta_load_version_check(settings: Settings, sample_xml_file: Path, moc
         pipeline.run(dataset="swissprot", mode="delta")
 
 
-def test_status_command_reporting(settings: Settings, db_adapter: PostgresAdapter):
+def test_status_command_reporting(settings: Settings, db_adapter: PostgresAdapter, mocker):
     """
     Tests that the get_current_release_version function reports the correct status.
     """
@@ -487,18 +495,23 @@ def test_status_command_reporting(settings: Settings, db_adapter: PostgresAdapte
     assert version is None, "Version should be None for an uninitialized database"
 
     # 2. After a load, it should return the correct version
-    # Manually create the metadata to test the read path specifically
-    release_info = {
-        "version": "2025_STATUS_TEST",
-        "release_date": datetime.date(2025, 2, 1),
-        "swissprot_entry_count": 1,
-        "trembl_entry_count": 1,
-    }
-    with postgres_connection(settings) as conn, conn.cursor() as cur:
-        db_adapter._create_production_schema_if_not_exists(cur)
-        conn.commit()
-
-    db_adapter.update_metadata(release_info)
+    # Mock a successful pipeline run to create the metadata
+    pipeline = PyLoadUniprotPipeline(settings)
+    pipeline.db_adapter.production_schema = db_adapter.production_schema
+    pipeline.db_adapter.staging_schema = db_adapter.staging_schema
+    mocker.patch.object(
+        extractor.Extractor,
+        "get_release_info",
+        return_value={
+            "version": "2025_STATUS_TEST",
+            "release_date": datetime.date(2025, 2, 1),
+            "swissprot_entry_count": 1,
+            "trembl_entry_count": 1,
+        },
+    )
+    # Create a dummy file to avoid FileNotFoundError
+    (settings.data_dir / "uniprot_sprot.xml.gz").touch()
+    pipeline.run(dataset="swissprot", mode="full")
 
     # Now, check the version again
     version = db_adapter.get_current_release_version()
@@ -600,7 +613,7 @@ def test_cli_full_load_with_env_vars(
 
 
 def test_full_etl_pipeline_with_generated_data(
-    settings: Settings, mocker
+    settings: Settings, db_adapter: PostgresAdapter, mocker
 ):
     """
     Tests the full pipeline using the data file generated by the
@@ -615,6 +628,8 @@ def test_full_etl_pipeline_with_generated_data(
     # 2. Configure the pipeline to use this file
     settings.data_dir = Path("./data")
     pipeline = PyLoadUniprotPipeline(settings)
+    pipeline.db_adapter.production_schema = db_adapter.production_schema
+    pipeline.db_adapter.staging_schema = db_adapter.staging_schema
 
     # 3. Mock the extractor
     mock_release_info = {
@@ -695,7 +710,7 @@ def sample_xml_malformed_file(tmp_path: Path) -> Path:
 
 
 def test_pipeline_fails_gracefully_on_malformed_xml(
-    settings: Settings, sample_xml_malformed_file: Path, mocker
+    settings: Settings, db_adapter: PostgresAdapter, sample_xml_malformed_file: Path, mocker
 ):
     """
     Tests that the pipeline raises a specific XMLSyntaxError if the input
@@ -712,6 +727,8 @@ def test_pipeline_fails_gracefully_on_malformed_xml(
 
     # --- Act & Assert ---
     pipeline = PyLoadUniprotPipeline(settings)
+    pipeline.db_adapter.production_schema = db_adapter.production_schema
+    pipeline.db_adapter.staging_schema = db_adapter.staging_schema
     with pytest.raises(etree.XMLSyntaxError, match="Opening and ending tag mismatch"):
         pipeline.run(dataset="swissprot", mode="full")
 
@@ -772,7 +789,7 @@ def sample_xml_missing_elements_file(tmp_path: Path) -> Path:
 
 
 def test_pipeline_handles_missing_optional_elements(
-    settings: Settings, sample_xml_missing_elements_file: Path, mocker
+    settings: Settings, db_adapter: PostgresAdapter, sample_xml_missing_elements_file: Path, mocker
 ):
     """
     Tests that the pipeline correctly handles XML entries with missing
@@ -796,6 +813,8 @@ def test_pipeline_handles_missing_optional_elements(
     # Force single-threaded execution to ensure logs are captured by caplog
     settings.num_workers = 1
     pipeline = PyLoadUniprotPipeline(settings)
+    pipeline.db_adapter.production_schema = db_adapter.production_schema
+    pipeline.db_adapter.staging_schema = db_adapter.staging_schema
 
     # --- Act ---
     pipeline.run(dataset="swissprot", mode="full")
@@ -871,7 +890,7 @@ def sample_xml_non_ascii_file(tmp_path: Path) -> Path:
 
 
 def test_pipeline_handles_non_ascii_characters(
-    settings: Settings, sample_xml_non_ascii_file: Path, mocker
+    settings: Settings, db_adapter: PostgresAdapter, sample_xml_non_ascii_file: Path, mocker
 ):
     """
     Tests that non-ASCII characters in text fields (like protein names or
@@ -893,6 +912,8 @@ def test_pipeline_handles_non_ascii_characters(
         },
     )
     pipeline = PyLoadUniprotPipeline(settings)
+    pipeline.db_adapter.production_schema = db_adapter.production_schema
+    pipeline.db_adapter.staging_schema = db_adapter.staging_schema
 
     # --- Act ---
     pipeline.run(dataset="swissprot", mode="full")
@@ -950,7 +971,7 @@ def sample_xml_duplicate_accession_file(tmp_path: Path) -> Path:
 
 @pytest.mark.parametrize("settings", [{"num_workers": 1}], indirect=True)
 def test_pipeline_handles_duplicate_accessions_in_source(
-    settings: Settings, sample_xml_duplicate_accession_file: Path, mocker, caplog
+    settings: Settings, db_adapter: PostgresAdapter, sample_xml_duplicate_accession_file: Path, mocker, caplog
 ):
     """
     Tests that if a source XML file contains duplicate primary accessions,
@@ -973,6 +994,8 @@ def test_pipeline_handles_duplicate_accessions_in_source(
         },
     )
     pipeline = PyLoadUniprotPipeline(settings)
+    pipeline.db_adapter.production_schema = db_adapter.production_schema
+    pipeline.db_adapter.staging_schema = db_adapter.staging_schema
 
     # --- Act ---
     logging.basicConfig(level=logging.WARNING)
@@ -994,7 +1017,7 @@ def test_pipeline_handles_duplicate_accessions_in_source(
 
 
 def test_delta_load_primary_accession_change(
-    settings: Settings, sample_xml_file: Path, sample_xml_v3_file: Path, mocker
+    settings: Settings, db_adapter: PostgresAdapter, sample_xml_file: Path, sample_xml_v3_file: Path, mocker
 ):
     """
     Tests that a delta load correctly handles a change in a protein's
@@ -1087,3 +1110,61 @@ def test_delta_load_primary_accession_change(
         # The total count should be 1 (only A1B2C3)
         cur.execute(f"SELECT COUNT(*) FROM {pipeline.db_adapter.production_schema}.proteins")
         assert cur.fetchone()[0] == 1, "Only the updated protein should exist"
+
+
+def test_full_load_rolls_back_on_data_load_failure(
+    settings: Settings, db_adapter: PostgresAdapter, sample_xml_file: Path, mocker
+):
+    """
+    Tests that a full load transaction is rolled back if an error occurs
+    during the data loading (COPY) phase, ensuring the database is left clean.
+    """
+    # --- Arrange ---
+    settings.data_dir = sample_xml_file.parent
+    sprot_file = settings.data_dir / "uniprot_sprot.xml.gz"
+    sample_xml_file.rename(sprot_file)
+
+    mocker.patch.object(
+        extractor.Extractor,
+        "get_release_info",
+        return_value={"version": "ROLLBACK_TEST"},
+    )
+
+    # Mock the load_data method on the PostgresAdapter to simulate a failure
+    # during the COPY command.
+    mocker.patch.object(
+        PostgresAdapter,
+        "bulk_load_intermediate",
+        side_effect=psycopg2.Error("Simulated COPY failure"),
+    )
+
+    pipeline = PyLoadUniprotPipeline(settings)
+    pipeline.db_adapter.production_schema = db_adapter.production_schema
+    pipeline.db_adapter.staging_schema = db_adapter.staging_schema
+
+    # --- Act & Assert ---
+    # The pipeline should raise the simulated exception
+    with pytest.raises(psycopg2.Error, match="Simulated COPY failure"):
+        pipeline.run(dataset="swissprot", mode="full")
+
+    # --- Assert Database State ---
+    # After the failed run, the staging schema should have been dropped,
+    # and no production schema should exist.
+    with postgres_connection(settings) as conn, conn.cursor() as cur:
+        # Check that the staging schema was cleaned up
+        cur.execute(
+            "SELECT 1 FROM pg_namespace WHERE nspname = %s",
+            (pipeline.db_adapter.staging_schema,),
+        )
+        assert (
+            cur.fetchone() is None
+        ), "Staging schema should be dropped on failure"
+
+        # Check that the production schema was not created
+        cur.execute(
+            "SELECT 1 FROM pg_namespace WHERE nspname = %s",
+            (pipeline.db_adapter.production_schema,),
+        )
+        assert (
+            cur.fetchone() is None
+        ), "Production schema should not be created on failure"

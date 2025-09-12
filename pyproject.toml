@@ -56,4 +56,5 @@ dev = [
     "black>=24.4.2",
     "types-requests>=2.32.0.20240712",
     "types-PyYAML>=6.0.12.20240712",
+    "memory-profiler>=0.61.0",
 ]

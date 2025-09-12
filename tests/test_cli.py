@@ -1,5 +1,6 @@
 from unittest.mock import MagicMock, patch
 
+import psycopg2
 from typer.testing import CliRunner
 
 from py_load_uniprot.cli import app
@@ -69,3 +70,26 @@ def test_check_config_command(mock_load_settings, mock_adapter_cls):
     assert result.exit_code == 0
     assert "Configuration and connectivity check passed" in result.stdout
     mock_adapter_instance.check_connection.assert_called_once()
+
+
+@patch("py_load_uniprot.cli.load_settings")
+@patch("psycopg2.connect")
+def test_cli_handles_db_connection_error(mock_psycopg2_connect, mock_load_settings):
+    """
+    Tests that a CLI command fails gracefully with a clear error message
+    if the database connection fails. We test this on the 'check-config'
+    command as it's the simplest way to trigger a connection.
+    """
+    # Arrange
+    # Mock psycopg2.connect to raise a known database connection error
+    mock_psycopg2_connect.side_effect = MagicMock(
+        side_effect=psycopg2.OperationalError("could not connect to server: Connection refused")
+    )
+
+    # Act
+    result = runner.invoke(app, ["check-config"])
+
+    # Assert
+    assert result.exit_code != 0, "CLI should exit with a non-zero code on DB error"
+    assert "An error occurred during the check" in result.stdout
+    assert "could not connect to server" in result.stdout

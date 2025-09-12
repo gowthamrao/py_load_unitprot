@@ -12,7 +12,6 @@ from psycopg2.extensions import connection, cursor
 from rich import print
 
 from py_load_uniprot.config import Settings
-from py_load_uniprot.transformer import TABLE_HEADERS
 
 TABLE_LOAD_ORDER = [
     "taxonomy",

@@ -12,7 +12,6 @@ from psycopg2.extensions import connection, cursor
 from rich import print
 
 from py_load_uniprot.config import Settings
-from py_load_uniprot.transformer import TABLE_HEADERS
 
 TABLE_LOAD_ORDER = [
     "taxonomy",
@@ -329,7 +328,27 @@ class PostgresAdapter(DatabaseAdapter):
 
     def _upsert_proteins(self, cur: cursor) -> None:
         print("Upserting proteins...")
-        sql = f"""
+
+        # Case 1: Handle proteins where the primary accession has changed.
+        # This requires deleting the old record and inserting the new one.
+        find_changed_accessions_sql = f"""
+        SELECT prod.primary_accession
+        FROM {self.production_schema}.proteins prod
+        JOIN {self.staging_schema}.proteins stage ON prod.uniprot_id = stage.uniprot_id
+        WHERE prod.primary_accession != stage.primary_accession;
+        """
+        cur.execute(find_changed_accessions_sql)
+        accessions_to_delete = [row[0] for row in cur.fetchall()]
+
+        if accessions_to_delete:
+            print(f"Found {len(accessions_to_delete)} proteins with changed primary accessions. Re-inserting them...")
+            delete_sql = f"DELETE FROM {self.production_schema}.proteins WHERE primary_accession = ANY(%s);"
+            cur.execute(delete_sql, (accessions_to_delete,))
+            print(f"  - {cur.rowcount} old protein records deleted.")
+
+        # Case 2: Standard upsert for all other proteins (new or updated).
+        # This will insert new proteins and update existing ones that didn't change their primary accession.
+        upsert_sql = f"""
         INSERT INTO {self.production_schema}.proteins
         SELECT * FROM {self.staging_schema}.proteins
         ON CONFLICT (primary_accession) DO UPDATE SET
@@ -343,7 +362,7 @@ class PostgresAdapter(DatabaseAdapter):
             db_references_data = EXCLUDED.db_references_data,
             evidence_data = EXCLUDED.evidence_data;
         """
-        cur.execute(sql)
+        cur.execute(upsert_sql)
         print(f"{cur.rowcount} proteins upserted.")
 
     def _upsert_sequences(self, cur: cursor) -> None:
@@ -398,13 +417,16 @@ class PostgresAdapter(DatabaseAdapter):
 
     def _delete_removed_proteins(self, cur: cursor) -> None:
         print("Identifying and deleting removed proteins...")
-        # Find proteins in production that are NOT in staging
+        # Find accessions in production that are NOT in the new data AND whose uniprot_id is also not present.
+        # This handles cases where the primary accession changes for a given protein ID.
         find_deleted_sql = f"""
         SELECT prod.primary_accession
         FROM {self.production_schema}.proteins prod
-        LEFT JOIN {self.staging_schema}.proteins stage
-        ON prod.primary_accession = stage.primary_accession
-        WHERE stage.primary_accession IS NULL;
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM {self.staging_schema}.proteins stage
+            WHERE stage.uniprot_id = prod.uniprot_id
+        );
         """
         cur.execute(find_deleted_sql)
         deleted_accessions = [row[0] for row in cur.fetchall()]

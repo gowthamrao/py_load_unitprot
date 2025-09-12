@@ -1,6 +1,7 @@
 import csv
 import gzip
 import json
+import logging
 import multiprocessing
 import os
 from collections import defaultdict
@@ -19,6 +20,7 @@ TABLE_HEADERS: dict[str, list[str]] = {
     "proteins": [
         "primary_accession",
         "uniprot_id",
+        "protein_name",
         "ncbi_taxid",
         "sequence_length",
         "molecular_weight",
@@ -107,6 +109,10 @@ def _parse_entry(elem: etree._Element, profile: str) -> dict[str, list[Any]]:
 
     # --- Proteins and Sequences ---
     uniprot_id = elem.findtext(_get_tag("name"))
+    protein_name_elem = elem.find(
+        f'{_get_tag("protein")}/{_get_tag("recommendedName")}/{_get_tag("fullName")}'
+    )
+    protein_name = protein_name_elem.text if protein_name_elem is not None else None
     seq_elem = elem.find(_get_tag("sequence"))
     sequence_length = seq_elem.get("length") if seq_elem is not None else None
     molecular_weight = seq_elem.get("mass") if seq_elem is not None else None
@@ -143,20 +149,23 @@ def _parse_entry(elem: etree._Element, profile: str) -> dict[str, list[Any]]:
         db_references_data = None
         evidence_data = None
 
-    data["proteins"].append(
-        [
-            primary_accession,
-            uniprot_id,
-            sequence_length,
-            molecular_weight,
-            created_date,
-            modified_date,
-            comments_data,
-            features_data,
-            db_references_data,
-            evidence_data,
-        ]
-    )
+    # This list is constructed to match the TABLE_HEADERS order,
+    # but with ncbi_taxid being inserted later.
+    protein_row_data = [
+        primary_accession,
+        uniprot_id,
+        protein_name,
+        sequence_length,
+        molecular_weight,
+        created_date,
+        modified_date,
+        comments_data,
+        features_data,
+        db_references_data,
+        evidence_data,
+    ]
+    data["proteins"].append(protein_row_data)
+
     if sequence:
         data["sequences"].append([primary_accession, sequence])
 
@@ -182,10 +191,11 @@ def _parse_entry(elem: etree._Element, profile: str) -> dict[str, list[Any]]:
             lineage = " > ".join(lineage_list)
             data["taxonomy"].append([ncbi_taxid, scientific_name, lineage])
 
-    # Add the extracted ncbi_taxid to the protein data.
-    # It will be None if not found, which is handled by the database schema (allows NULL).
+    # Add the extracted ncbi_taxid to the protein data at the correct index.
+    # The order is: primary_accession, uniprot_id, protein_name, ncbi_taxid, ...
+    # So we insert at index 3.
     protein_row = data["proteins"][0]
-    protein_row.insert(2, ncbi_taxid) # Insert taxid after uniprot_id
+    protein_row.insert(3, ncbi_taxid)
 
     # --- Genes ---
     for gene_elem in elem.findall(_get_tag("gene")):
@@ -244,11 +254,13 @@ def _writer_process(
     """
     Writer process function.
     Pulls parsed data from the results queue and writes it to TSV files.
-    Also manages a progress bar.
+    Also manages a progress bar and handles de-duplication of proteins and taxonomy.
     """
     processed_count = 0
-    # Use a set to efficiently handle duplicate taxonomy entries, as they are common
+    # Use sets to efficiently handle duplicate entries, as they are common
     seen_taxonomy_ids: set[int] = set()
+    seen_protein_accessions: set[str] = set()
+    duplicate_accessions: set[str] = set()
 
     with (
         FileWriterManager(output_dir) as writers,
@@ -263,22 +275,53 @@ def _writer_process(
 
         while processed_count < total_entries:
             parsed_data = results_queue.get()
-            if parsed_data:  # Ensure it's not an empty dict from a parse error
-                for table_name, rows in parsed_data.items():
-                    if table_name == "taxonomy":
-                        # De-duplicate taxonomy entries before writing
-                        unique_rows = []
-                        for row in rows:
-                            tax_id = row[0]  # ncbi_taxid is the first element
-                            if tax_id not in seen_taxonomy_ids:
-                                unique_rows.append(row)
-                                seen_taxonomy_ids.add(tax_id)
-                        if unique_rows:
-                            writers[table_name].writerows(unique_rows)
-                    else:
-                        writers[table_name].writerows(rows)
+            if not parsed_data:  # Handle empty dicts from parse errors
+                processed_count += 1
+                progress.update(task, advance=1)
+                continue
+
+            # De-duplication logic is now at the entry level.
+            # If the protein is a duplicate, we skip the entire entry.
+            protein_row = parsed_data.get("proteins", [[]])[0]
+            if not protein_row:
+                processed_count += 1
+                progress.update(task, advance=1)
+                continue
+
+            accession = protein_row[0]
+            if accession in seen_protein_accessions:
+                duplicate_accessions.add(accession)
+                processed_count += 1
+                progress.update(task, advance=1)
+                continue  # Skip the entire entry for this duplicate protein
+
+            seen_protein_accessions.add(accession)
+
+            # If not a duplicate, write all data for this entry
+            for table_name, rows in parsed_data.items():
+                if table_name == "taxonomy":
+                    # Taxonomy still needs its own de-duplication as it's shared across entries
+                    unique_tax_rows = []
+                    for row in rows:
+                        tax_id = row[0]
+                        if tax_id not in seen_taxonomy_ids:
+                            unique_tax_rows.append(row)
+                            seen_taxonomy_ids.add(tax_id)
+                    if unique_tax_rows:
+                        writers[table_name].writerows(unique_tax_rows)
+                else:
+                    writers[table_name].writerows(rows)
+
             processed_count += 1
             progress.update(task, advance=1)
+
+    if duplicate_accessions:
+        logging.warning(
+            f"Found {len(duplicate_accessions)} duplicate primary accessions in the source file. "
+            f"Only the first occurrence of each was written to the output. "
+            f"Duplicates: {', '.join(sorted(list(duplicate_accessions))[:5])}"
+            f"{'...' if len(duplicate_accessions) > 5 else ''}"
+        )
 
 
 def _get_total_entries(xml_file: Path) -> int:
@@ -296,17 +339,96 @@ def _get_total_entries(xml_file: Path) -> int:
     return count
 
 
+def _transform_single_threaded(xml_file: Path, output_dir: Path, profile: str) -> None:
+    """
+    A single-threaded version of the transformer. This is used when num_workers=1
+    to avoid multiprocessing overhead and allow logs to be captured in tests.
+    """
+    print("Running transformation in single-threaded mode.")
+    total_entries = _get_total_entries(xml_file)
+    if total_entries == 0:
+        print("[yellow]Warning: No entries found. Nothing to do.[/yellow]")
+        return
+
+    # Sets for de-duplication
+    seen_taxonomy_ids: set[int] = set()
+    seen_protein_accessions: set[str] = set()
+    duplicate_accessions: set[str] = set()
+
+    with (
+        FileWriterManager(output_dir) as writers,
+        Progress(
+            TextColumn("[bold blue]Parsing Entries...", justify="right"),
+            BarColumn(),
+            "[progress.percentage]{task.percentage:>3.1f}%",
+            TextColumn("({task.completed} of {task.total})"),
+        ) as progress,
+        gzip.open(xml_file, "rb") as f_in,
+    ):
+        task = progress.add_task("Parsing...", total=total_entries)
+        # Combine producer, parser, and writer into one loop
+        for event, elem in etree.iterparse(f_in, events=("end",), tag=_get_tag("entry")):
+            parsed_data = _parse_entry(elem, profile)
+
+            if parsed_data:
+                # De-duplicate protein at the entry level
+                protein_row = parsed_data.get("proteins", [[]])[0]
+                accession = protein_row[0] if protein_row else None
+
+                if accession and accession in seen_protein_accessions:
+                    duplicate_accessions.add(accession)
+                else:
+                    if accession:
+                        seen_protein_accessions.add(accession)
+                    # Write all data for this new entry
+                    for table_name, rows in parsed_data.items():
+                        if table_name == "taxonomy":
+                            unique_tax_rows = []
+                            for row in rows:
+                                tax_id = row[0]
+                                if tax_id not in seen_taxonomy_ids:
+                                    unique_tax_rows.append(row)
+                                    seen_taxonomy_ids.add(tax_id)
+                            if unique_tax_rows:
+                                writers[table_name].writerows(unique_tax_rows)
+                        else:
+                            writers[table_name].writerows(rows)
+
+            progress.update(task, advance=1)
+            # Crucial memory management
+            elem.clear()
+            while elem.getprevious() is not None:
+                del elem.getparent()[0]
+
+    if duplicate_accessions:
+        logging.warning(
+            f"Found {len(duplicate_accessions)} duplicate primary accessions in the source file. "
+            f"Only the first occurrence of each was written to the output. "
+            f"Duplicates: {', '.join(sorted(list(duplicate_accessions))[:5])}"
+            f"{'...' if len(duplicate_accessions) > 5 else ''}"
+        )
+    print("[bold green]Single-threaded transformation complete.[/bold green]")
+
+
 def transform_xml_to_tsv(
     xml_file: Path,
     output_dir: Path,
     profile: str,
-    num_workers: Optional[int] = os.cpu_count(),
+    num_workers: Optional[int] = None,
 ) -> None:
     """
-    Parses a UniProt XML file in parallel and transforms the data into gzipped TSV files.
+    Parses a UniProt XML file and transforms the data into gzipped TSV files.
+    If num_workers is 1, it runs in a single thread. Otherwise, it uses a
+    multiprocessing pool.
     """
-    # Fallback to 1 worker if cpu_count is None
-    num_workers_actual = num_workers if num_workers is not None else 1
+    num_workers_actual = num_workers
+    if num_workers_actual is None:
+        num_workers_actual = os.cpu_count() or 1
+
+    if num_workers_actual == 1:
+        _transform_single_threaded(xml_file, output_dir, profile)
+        return
+
     print(
         f"Starting parallel transformation of {xml_file.name} with {num_workers_actual} worker processes..."
     )
@@ -322,52 +444,36 @@ def transform_xml_to_tsv(
 
     # Use a manager for shared queues between processes
     with multiprocessing.Manager() as manager:
-        tasks_queue = manager.Queue(
-            maxsize=num_workers_actual * 4
-        )  # Bounded queue to prevent memory bloat
+        tasks_queue = manager.Queue(maxsize=num_workers_actual * 4)
         results_queue = manager.Queue()
 
-        # Start the dedicated writer process
         writer = multiprocessing.Process(
             target=_writer_process,
             args=(results_queue, output_dir, total_entries, num_workers_actual),
         )
         writer.start()
 
-        # Start a pool of worker processes, passing the profile to each worker
         pool = multiprocessing.Pool(
             num_workers_actual,
             _worker_parse_entry,
-            (
-                tasks_queue,
-                results_queue,
-                profile,
-            ),
+            (tasks_queue, results_queue, profile),
         )
 
-        # --- Producer ---
-        # The main process becomes the producer, reading the XML and queuing tasks
         with gzip.open(xml_file, "rb") as f_in:
             for event, elem in etree.iterparse(
                 f_in, events=("end",), tag=_get_tag("entry")
             ):
-                # Convert the element to a string to pass it to the queue
                 xml_string = etree.tostring(elem, encoding="unicode")
                 tasks_queue.put(xml_string)
-                # Crucial memory management
                 elem.clear()
                 while elem.getprevious() is not None:
                     del elem.getparent()[0]
 
-        # Signal workers to terminate by putting None on the queue
         for _ in range(num_workers_actual):
             tasks_queue.put(None)
 
-        # Wait for all worker processes to finish
         pool.close()
         pool.join()
-
-        # Wait for the writer process to finish
         writer.join()
 
     print("[bold green]Parallel transformation complete.[/bold green]")

@@ -1,17 +1,19 @@
 import datetime
 import gzip
+import json
+import logging
 from pathlib import Path
 
 import psycopg2
 import pytest
+from lxml import etree
 from testcontainers.postgres import PostgresContainer
 from typer.testing import CliRunner
 
-from py_load_uniprot import PyLoadUniprotPipeline, extractor, transformer
+from py_load_uniprot import PyLoadUniprotPipeline, extractor
 from py_load_uniprot.cli import app
 from py_load_uniprot.config import Settings, load_settings
 from py_load_uniprot.db_manager import (
-    TABLE_LOAD_ORDER,
     PostgresAdapter,
     postgres_connection,
 )
@@ -80,9 +82,12 @@ def sample_xml_file(tmp_path: Path, sample_xml_content: str) -> Path:
 
 
 @pytest.fixture
-def settings(postgres_container: PostgresContainer) -> Settings:
+def settings(postgres_container: PostgresContainer, request) -> Settings:
     """
     Provides a Settings object configured to use the test container.
+    This fixture can be parameterized to override default settings.
+    Example:
+    @pytest.mark.parametrize("settings", [{"num_workers": 1}], indirect=True)
     """
     # Use load_settings which initializes a new object each time
     settings = load_settings()
@@ -91,6 +96,12 @@ def settings(postgres_container: PostgresContainer) -> Settings:
     settings.db.user = postgres_container.username
     settings.db.password = postgres_container.password
     settings.db.dbname = postgres_container.dbname
+
+    # Apply any parameters passed via request
+    if hasattr(request, "param"):
+        for key, value in request.param.items():
+            setattr(settings, key, value)
+
     return settings
 
 
@@ -634,3 +645,445 @@ def test_full_etl_pipeline_with_generated_data(
         result = cur.fetchone()
         assert result is not None, "Protein P12345 should have a result for ncbi_taxid"
         assert result[0] == 9986, "Protein P12345 should be linked to taxonomy 9986"
+
+
+# V3: P12345's primary accession is changed to A1B2C3
+SAMPLE_XML_V3_CONTENT = """<?xml version="1.0" encoding="UTF-8"?>
+<uniprot xmlns="http://uniprot.org/uniprot">
+<entry dataset="Swiss-Prot" created="2000-05-30" modified="2025-02-01" version="152">
+  <accession>A1B2C3</accession>
+  <accession>P12345</accession>
+  <accession>Q9Y5Y5</accession>
+  <name>TEST1_HUMAN</name>
+  <protein>
+    <recommendedName><fullName>Test protein 1 - Accession Change</fullName></recommendedName>
+  </protein>
+  <sequence length="10" mass="1111">MTESTSEQAA</sequence>
+</entry>
+</uniprot>
+"""
+
+
+@pytest.fixture
+def sample_xml_v3_file(tmp_path: Path) -> Path:
+    """Creates a gzipped sample V3 XML file for delta load testing (accession change)."""
+    xml_path = tmp_path / "sample_v3.xml.gz"
+    with gzip.open(xml_path, "wt", encoding="utf-8") as f:
+        f.write(SAMPLE_XML_V3_CONTENT)
+    return xml_path
+
+
+SAMPLE_XML_MALFORMED_CONTENT = """<?xml version="1.0" encoding="UTF-8"?>
+<uniprot xmlns="http://uniprot.org/uniprot">
+<entry dataset="Swiss-Prot" created="2000-05-30" modified="2024-07-17" version="150">
+  <accession>P12345</accession>
+  <name>TEST1_HUMAN</name>
+  <sequence length="10" mass="1111">MTESTSEQAA</sequence>
+</entry>
+<entry> <!-- Missing closing tag -->
+</uniprot>
+"""
+
+
+@pytest.fixture
+def sample_xml_malformed_file(tmp_path: Path) -> Path:
+    """Creates a gzipped, malformed XML file for testing."""
+    xml_path = tmp_path / "sample_malformed.xml.gz"
+    with gzip.open(xml_path, "wt", encoding="utf-8") as f:
+        f.write(SAMPLE_XML_MALFORMED_CONTENT)
+    return xml_path
+
+
+def test_pipeline_fails_gracefully_on_malformed_xml(
+    settings: Settings, sample_xml_malformed_file: Path, mocker
+):
+    """
+    Tests that the pipeline raises a specific XMLSyntaxError if the input
+    XML is malformed, ensuring robust error handling.
+    """
+    # --- Arrange ---
+    settings.data_dir = sample_xml_malformed_file.parent
+    sprot_file = settings.data_dir / "uniprot_sprot.xml.gz"
+    sample_xml_malformed_file.rename(sprot_file)
+
+    mocker.patch.object(
+        extractor.Extractor, "get_release_info", return_value={"version": "MALFORMED"}
+    )
+
+    # --- Act & Assert ---
+    pipeline = PyLoadUniprotPipeline(settings)
+    with pytest.raises(etree.XMLSyntaxError, match="Opening and ending tag mismatch"):
+        pipeline.run(dataset="swissprot", mode="full")
+
+
+SAMPLE_XML_MISSING_ELEMENTS_CONTENT = """<?xml version="1.0" encoding="UTF-8"?>
+<uniprot xmlns="http://uniprot.org/uniprot">
+<!-- Entry 1: Missing <gene> tag -->
+<entry dataset="Swiss-Prot" created="2000-05-30" modified="2024-07-17" version="150">
+  <accession>M12345</accession>
+  <name>MISSING_GENE</name>
+  <protein>
+    <recommendedName><fullName>Protein without a gene tag</fullName></recommendedName>
+  </protein>
+  <organism>
+    <name type="scientific">Homo sapiens</name>
+    <dbReference type="NCBI Taxonomy" id="9606"/>
+  </organism>
+  <sequence length="5" mass="555">MSEQ</sequence>
+</entry>
+<!-- Entry 2: Missing <sequence> tag -->
+<entry dataset="Swiss-Prot" created="2001-01-01" modified="2024-01-01" version="10">
+  <accession>M67890</accession>
+  <name>MISSING_SEQ</name>
+  <protein>
+    <recommendedName><fullName>Protein without a sequence</fullName></recommendedName>
+  </protein>
+  <gene><name type="primary">MSG1</name></gene>
+  <organism>
+    <name type="scientific">Mus musculus</name>
+    <dbReference type="NCBI Taxonomy" id="10090"/>
+  </organism>
+</entry>
+<!-- Entry 3: Missing <fullName> inside <recommendedName> -->
+<entry dataset="TrEMBL" created="2002-02-02" modified="2024-02-02" version="5">
+  <accession>M11111</accession>
+  <name>MISSING_NAME</name>
+  <protein>
+    <recommendedName></recommendedName>
+  </protein>
+  <gene><name type="primary">MSN1</name></gene>
+  <organism>
+    <name type="scientific">Rattus norvegicus</name>
+    <dbReference type="NCBI Taxonomy" id="10116"/>
+  </organism>
+  <sequence length="3" mass="333">MSN</sequence>
+</entry>
+</uniprot>
+"""
+
+
+@pytest.fixture
+def sample_xml_missing_elements_file(tmp_path: Path) -> Path:
+    """Creates a gzipped sample XML file with missing optional elements."""
+    xml_path = tmp_path / "sample_missing_elements.xml.gz"
+    with gzip.open(xml_path, "wt", encoding="utf-8") as f:
+        f.write(SAMPLE_XML_MISSING_ELEMENTS_CONTENT)
+    return xml_path
+
+
+def test_pipeline_handles_missing_optional_elements(
+    settings: Settings, sample_xml_missing_elements_file: Path, mocker
+):
+    """
+    Tests that the pipeline correctly handles XML entries with missing
+    optional elements (e.g., no gene, no sequence), loading them as NULLs.
+    """
+    # --- Arrange ---
+    settings.data_dir = sample_xml_missing_elements_file.parent
+    sprot_file = settings.data_dir / "uniprot_sprot.xml.gz"
+    sample_xml_missing_elements_file.rename(sprot_file)
+
+    mocker.patch.object(
+        extractor.Extractor,
+        "get_release_info",
+        return_value={
+            "version": "MISSING_ELEMENTS_TEST",
+            "release_date": datetime.date(2025, 1, 1),
+            "swissprot_entry_count": 3,
+            "trembl_entry_count": 0,
+        },
+    )
+    # Force single-threaded execution to ensure logs are captured by caplog
+    settings.num_workers = 1
+    pipeline = PyLoadUniprotPipeline(settings)
+
+    # --- Act ---
+    pipeline.run(dataset="swissprot", mode="full")
+
+    # --- Assert ---
+    with postgres_connection(settings) as conn, conn.cursor() as cur:
+        prod_schema = pipeline.db_adapter.production_schema
+        # Check that all 3 proteins were loaded
+        cur.execute(f"SELECT COUNT(*) FROM {prod_schema}.proteins")
+        assert cur.fetchone()[0] == 3, "All three proteins should be loaded"
+
+        # 1. Check protein with missing <gene>
+        cur.execute(
+            f"SELECT 1 FROM {prod_schema}.genes WHERE protein_accession = 'M12345'"
+        )
+        assert (
+            cur.fetchone() is None
+        ), "Protein M12345 should have no corresponding gene entry"
+
+        # 2. Check protein with missing <sequence>
+        cur.execute(
+            f"SELECT sequence_length, molecular_weight FROM {prod_schema}.proteins WHERE primary_accession = 'M67890'"
+        )
+        row = cur.fetchone()
+        assert row is not None
+        assert row[0] is None, "Sequence length should be NULL"
+        assert row[1] is None, "Molecular weight should be NULL"
+
+        # 3. Check protein with missing <fullName>
+        cur.execute(
+            f"SELECT protein_name FROM {prod_schema}.proteins WHERE primary_accession = 'M11111'"
+        )
+        row = cur.fetchone()
+        assert row is not None
+        assert row[0] is None, "Protein name should be NULL for entry with empty recommendedName"
+
+        # 4. Check a protein that has a name
+        cur.execute(
+            f"SELECT protein_name FROM {prod_schema}.proteins WHERE primary_accession = 'M12345'"
+        )
+        row = cur.fetchone()
+        assert row is not None
+        assert row[0] == "Protein without a gene tag"
+
+
+SAMPLE_XML_NON_ASCII_CONTENT = """<?xml version="1.0" encoding="UTF-8"?>
+<uniprot xmlns="http://uniprot.org/uniprot">
+<entry dataset="Swiss-Prot" created="2000-05-30" modified="2024-07-17" version="150">
+  <accession>N0N4SC11</accession>
+  <name>NON_ASCII</name>
+  <protein>
+    <recommendedName><fullName>α-synuclein</fullName></recommendedName>
+  </protein>
+  <organism>
+    <name type="scientific">Homo sapiens</name>
+    <dbReference type="NCBI Taxonomy" id="9606"/>
+  </organism>
+  <comment type="function"><text>A protein involved in neurotransmitter release, with a name containing Greek letters: αβγ.</text></comment>
+  <sequence length="5" mass="555">MSEQ</sequence>
+</entry>
+</uniprot>
+"""
+
+
+@pytest.fixture
+def sample_xml_non_ascii_file(tmp_path: Path) -> Path:
+    """Creates a gzipped sample XML file with non-ASCII characters."""
+    xml_path = tmp_path / "sample_non_ascii.xml.gz"
+    # Ensure encoding is explicitly set to utf-8
+    with gzip.open(xml_path, "wt", encoding="utf-8") as f:
+        f.write(SAMPLE_XML_NON_ASCII_CONTENT)
+    return xml_path
+
+
+def test_pipeline_handles_non_ascii_characters(
+    settings: Settings, sample_xml_non_ascii_file: Path, mocker
+):
+    """
+    Tests that non-ASCII characters in text fields (like protein names or
+    comments) are correctly handled and persisted to the database.
+    """
+    # --- Arrange ---
+    settings.data_dir = sample_xml_non_ascii_file.parent
+    sprot_file = settings.data_dir / "uniprot_sprot.xml.gz"
+    sample_xml_non_ascii_file.rename(sprot_file)
+
+    mocker.patch.object(
+        extractor.Extractor,
+        "get_release_info",
+        return_value={
+            "version": "NON_ASCII_TEST",
+            "release_date": datetime.date(2025, 1, 1),
+            "swissprot_entry_count": 1,
+            "trembl_entry_count": 0,
+        },
+    )
+    pipeline = PyLoadUniprotPipeline(settings)
+
+    # --- Act ---
+    pipeline.run(dataset="swissprot", mode="full")
+
+    # --- Assert ---
+    with postgres_connection(settings) as conn, conn.cursor() as cur:
+        prod_schema = pipeline.db_adapter.production_schema
+
+        # 1. Check the protein name
+        cur.execute(
+            f"SELECT protein_name FROM {prod_schema}.proteins WHERE primary_accession = 'N0N4SC11'"
+        )
+        row = cur.fetchone()
+        assert row is not None
+        assert row[0] == "α-synuclein"
+
+        # 2. Check the comment data
+        cur.execute(
+            f"SELECT comments_data FROM {prod_schema}.proteins WHERE primary_accession = 'N0N4SC11'"
+        )
+        row = cur.fetchone()
+        assert row is not None
+        comments_data = row[0]
+        assert "αβγ" in json.dumps(comments_data, ensure_ascii=False)
+
+
+SAMPLE_XML_DUPLICATE_ACCESSION_CONTENT = """<?xml version="1.0" encoding="UTF-8"?>
+<uniprot xmlns="http://uniprot.org/uniprot">
+<entry dataset="Swiss-Prot" created="2000-05-30" modified="2024-07-17" version="150">
+  <accession>P12345</accession>
+  <name>TEST1_HUMAN_V1</name>
+  <protein><recommendedName><fullName>Test protein 1, Version 1</fullName></recommendedName></protein>
+  <organism><name type="scientific">Homo sapiens</name><dbReference type="NCBI Taxonomy" id="9606"/></organism>
+  <sequence length="10" mass="1111">MTESTSEQAA</sequence>
+</entry>
+<entry dataset="Swiss-Prot" created="2001-01-01" modified="2025-01-01" version="151">
+  <accession>P12345</accession>
+  <name>TEST1_HUMAN_V2</name>
+  <protein><recommendedName><fullName>Test protein 1, Version 2</fullName></recommendedName></protein>
+  <organism><name type="scientific">Homo sapiens</name><dbReference type="NCBI Taxonomy" id="9606"/></organism>
+  <sequence length="11" mass="2222">MTESTSEQAAX</sequence>
+</entry>
+</uniprot>
+"""
+
+
+@pytest.fixture
+def sample_xml_duplicate_accession_file(tmp_path: Path) -> Path:
+    """Creates a gzipped sample XML file with a duplicate primary accession."""
+    xml_path = tmp_path / "sample_duplicate.xml.gz"
+    with gzip.open(xml_path, "wt", encoding="utf-8") as f:
+        f.write(SAMPLE_XML_DUPLICATE_ACCESSION_CONTENT)
+    return xml_path
+
+
+@pytest.mark.parametrize("settings", [{"num_workers": 1}], indirect=True)
+def test_pipeline_handles_duplicate_accessions_in_source(
+    settings: Settings, sample_xml_duplicate_accession_file: Path, mocker, caplog
+):
+    """
+    Tests that if a source XML file contains duplicate primary accessions,
+    the pipeline's de-duplication step correctly handles it by loading only
+    one version and logging a warning.
+    """
+    # --- Arrange ---
+    settings.data_dir = sample_xml_duplicate_accession_file.parent
+    sprot_file = settings.data_dir / "uniprot_sprot.xml.gz"
+    sample_xml_duplicate_accession_file.rename(sprot_file)
+
+    mocker.patch.object(
+        extractor.Extractor,
+        "get_release_info",
+        return_value={
+            "version": "DUPLICATE_TEST",
+            "release_date": datetime.date(2025, 1, 1),
+            "swissprot_entry_count": 2,
+            "trembl_entry_count": 0,
+        },
+    )
+    pipeline = PyLoadUniprotPipeline(settings)
+
+    # --- Act ---
+    logging.basicConfig(level=logging.WARNING)
+    with caplog.at_level(logging.WARNING):
+        pipeline.run(dataset="swissprot", mode="full")
+
+    # --- Assert ---
+    # 1. Check that a warning was logged
+    assert "Found 1 duplicate primary accessions" in caplog.text
+    assert "P12345" in caplog.text
+
+    # 2. Check that only one of the proteins was loaded
+    with postgres_connection(settings) as conn, conn.cursor() as cur:
+        prod_schema = pipeline.db_adapter.production_schema
+        cur.execute(
+            f"SELECT COUNT(*) FROM {prod_schema}.proteins WHERE primary_accession = 'P12345'"
+        )
+        assert cur.fetchone()[0] == 1, "Only one protein with accession P12345 should be loaded"
+
+
+def test_delta_load_primary_accession_change(
+    settings: Settings, sample_xml_file: Path, sample_xml_v3_file: Path, mocker
+):
+    """
+    Tests that a delta load correctly handles a change in a protein's
+    primary accession number, which is a critical edge case for maintaining
+    data integrity.
+    """
+    # --- Arrange ---
+    settings.data_dir = sample_xml_file.parent
+    sprot_file = settings.data_dir / "uniprot_sprot.xml.gz"
+    sample_xml_file.rename(sprot_file)
+    pipeline = PyLoadUniprotPipeline(settings)
+
+    # --- Act 1: Initial Full Load (V1) ---
+    print("--- Running Initial Full Load (V1) for Accession Change Test ---")
+    mocker.patch.object(
+        extractor.Extractor,
+        "get_release_info",
+        return_value={
+            "version": "V1_ACC_TEST",
+            "release_date": datetime.date(2024, 1, 1),
+            "swissprot_entry_count": 2,
+            "trembl_entry_count": 0,
+        },
+    )
+    pipeline.run(dataset="swissprot", mode="full")
+
+    # --- Assert 1: Verify initial state ---
+    with postgres_connection(settings) as conn, conn.cursor() as cur:
+        cur.execute(
+            f"SELECT 1 FROM {pipeline.db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'"
+        )
+        assert cur.fetchone() is not None, "Protein P12345 should exist after full load"
+        cur.execute(
+            f"SELECT 1 FROM {pipeline.db_adapter.production_schema}.proteins WHERE primary_accession = 'A1B2C3'"
+        )
+        assert cur.fetchone() is None, "Protein A1B2C3 should not exist yet"
+
+    # --- Act 2: Delta Load (V3) ---
+    print("--- Running Delta Load (V3) for Accession Change ---")
+    sprot_file.rename(settings.data_dir / "uniprot_sprot_v1.xml.gz")
+    sample_xml_v3_file.rename(sprot_file)
+    mocker.patch.object(
+        extractor.Extractor,
+        "get_release_info",
+        return_value={
+            "version": "V3_ACC_TEST",
+            "release_date": datetime.date(2025, 2, 1),
+            "swissprot_entry_count": 1,
+            "trembl_entry_count": 0,
+        },
+    )
+    pipeline.run(dataset="swissprot", mode="delta")
+
+    # --- Assert 2: Verify state after delta load ---
+    with postgres_connection(settings) as conn, conn.cursor() as cur:
+        # The old primary accession should be gone
+        cur.execute(
+            f"SELECT 1 FROM {pipeline.db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'"
+        )
+        assert (
+            cur.fetchone() is None
+        ), "Old primary accession P12345 should be deleted"
+
+        # The new primary accession should exist
+        cur.execute(
+            f"SELECT uniprot_id FROM {pipeline.db_adapter.production_schema}.proteins WHERE primary_accession = 'A1B2C3'"
+        )
+        result = cur.fetchone()
+        assert (
+            result is not None
+        ), "New primary accession A1B2C3 should be inserted"
+        assert (
+            result[0] == "TEST1_HUMAN"
+        ), "Uniprot ID should remain the same for the new accession"
+
+        # Check that the old accession is now a secondary accession for the new primary one
+        cur.execute(
+            f"SELECT 1 FROM {pipeline.db_adapter.production_schema}.accessions WHERE protein_accession = 'A1B2C3' AND secondary_accession = 'P12345'"
+        )
+        assert (
+            cur.fetchone() is not None
+        ), "P12345 should now be a secondary accession for A1B2C3"
+
+        # Check that other proteins (like P67890) from the initial load were correctly deleted as they were not in the V3 file
+        cur.execute(
+            f"SELECT 1 FROM {pipeline.db_adapter.production_schema}.proteins WHERE primary_accession = 'P67890'"
+        )
+        assert cur.fetchone() is None, "P67890 should have been deleted"
+
+        # The total count should be 1 (only A1B2C3)
+        cur.execute(f"SELECT COUNT(*) FROM {pipeline.db_adapter.production_schema}.proteins")
+        assert cur.fetchone()[0] == 1, "Only the updated protein should exist"

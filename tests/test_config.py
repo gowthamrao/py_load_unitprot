@@ -4,7 +4,7 @@ from unittest.mock import patch
 import pytest
 import yaml
 
-from py_load_uniprot.config import DBSettings, Settings, load_settings
+from py_load_uniprot.config import DBSettings, load_settings
 
 
 def test_db_settings_connection_string():

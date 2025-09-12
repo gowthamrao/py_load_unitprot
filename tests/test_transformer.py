@@ -107,24 +107,26 @@ def test_transform_xml_to_tsv_creates_correct_output(
 
     # Check P12345
     p1_row = protein_data[0]
-    assert p1_row[0:7] == [
+    assert p1_row[0:8] == [
         "P12345",
         "TEST1_HUMAN",
+        "Test protein 1",
         "9606",
         "10",
         "1111",
         "2000-05-30",
         "2024-07-17",
     ]
-    assert json.loads(p1_row[7])[0]["tag"] == "comment"
-    assert json.loads(p1_row[8])[0]["tag"] == "feature"
-    assert p1_row[9] == ""
+    assert json.loads(p1_row[8])[0]["tag"] == "comment"
+    assert json.loads(p1_row[9])[0]["tag"] == "feature"
+    assert p1_row[10] == ""
 
     # Check P67890
     p2_row = protein_data[1]
-    assert p2_row[0:7] == [
+    assert p2_row[0:8] == [
         "P67890",
         "TEST2_MOUSE",
+        "Test protein 2",
         "10090",
         "12",
         "2222",
@@ -201,8 +203,8 @@ def test_parse_entry_extracts_evidence_data():
     assert len(parsed_data["proteins"]) == 1
 
     protein_row = parsed_data["proteins"][0]
-    # The evidence_data is the 11th column (index 10)
-    evidence_json_str = protein_row[10]
+    # The evidence_data is now the 12th column (index 11) due to protein_name
+    evidence_json_str = protein_row[11]
 
     assert evidence_json_str is not None
     evidence_list = json.loads(evidence_json_str)

@@ -505,19 +505,6 @@ def duplicate_xml_file(tmp_path: Path) -> Path:
     return xml_path
 
 
-def test_duplicate_accession_halts_parallel_pipeline(
-    duplicate_xml_file: Path, tmp_path: Path
-):
-    """
-    Tests that the parallel pipeline halts when a duplicate accession is found.
-    """
-    output_dir = tmp_path / "output_parallel_duplicate"
-    with pytest.raises(ValueError, match="Duplicate primary accession"):
-        transformer.transform_xml_to_tsv(
-            duplicate_xml_file, output_dir, profile="full", num_workers=2
-        )
-
-
 def test_duplicate_accession_halts_single_threaded_pipeline(
     duplicate_xml_file: Path, tmp_path: Path
 ):

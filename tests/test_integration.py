@@ -1240,6 +1240,84 @@ def test_full_load_rolls_back_on_data_load_failure(
         ), "Production schema should not be created on failure"
 
 
+def test_full_load_rolls_back_on_schema_swap_failure(
+    settings: Settings, db_adapter: PostgresAdapter, sample_xml_file: Path, mocker
+):
+    """
+    Tests that a full load transaction is rolled back if an error occurs
+    during the critical schema swap operation.
+    """
+    # --- Arrange 1: Perform an initial successful load (V1) ---
+    settings.data_dir = sample_xml_file.parent
+    sprot_file = settings.data_dir / "uniprot_sprot.xml.gz"
+    sample_xml_file.rename(sprot_file)
+    mocker.patch.object(
+        extractor.Extractor,
+        "get_release_info",
+        return_value={
+            "version": "V1_SWAP_TEST",
+            "release_date": datetime.date(2024, 1, 1),
+            "swissprot_entry_count": 2,
+            "trembl_entry_count": 0,
+        },
+    )
+    pipeline = PyLoadUniprotPipeline(settings)
+    pipeline.db_adapter.production_schema = db_adapter.production_schema
+    pipeline.db_adapter.staging_schema = db_adapter.staging_schema
+    pipeline.run(dataset="swissprot", mode="full")
+
+    # Verify V1 state
+    with postgres_connection(settings) as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT version FROM {db_adapter.production_schema}.py_load_uniprot_metadata")
+        assert cur.fetchone()[0] == "V1_SWAP_TEST"
+
+    # --- Arrange 2: Mock a failure during the second load (V2) ---
+    mocker.patch.object(
+        extractor.Extractor,
+        "get_release_info",
+        return_value={
+            "version": "V2_SWAP_TEST_FAIL",
+            "release_date": datetime.date(2025, 1, 1),
+            "swissprot_entry_count": 2,
+            "trembl_entry_count": 0,
+        },
+    )
+
+    # We will simulate a failure *after* the schema swap has occurred, but *before*
+    # the transaction is committed. The `_create_metadata_tables` call is a perfect
+    # target for this.
+    mocker.patch.object(
+        pipeline.db_adapter,
+        "_create_metadata_tables",
+        side_effect=psycopg2.Error("Simulated failure after swap"),
+    )
+
+    # --- Act & Assert: The pipeline should fail ---
+    with pytest.raises(psycopg2.Error, match="Simulated failure after swap"):
+        pipeline.run(dataset="swissprot", mode="full")
+
+    # --- Assert Database State ---
+    # The key assertion is that the original V1 database is still intact.
+    with postgres_connection(settings) as conn, conn.cursor() as cur:
+        # 1. The production schema should exist.
+        cur.execute("SELECT 1 FROM pg_namespace WHERE nspname = %s", (db_adapter.production_schema,))
+        assert cur.fetchone() is not None, "Production schema should still exist after failed swap"
+
+        # 2. It should still be the V1 data.
+        cur.execute(f"SELECT version FROM {db_adapter.production_schema}.py_load_uniprot_metadata")
+        assert cur.fetchone()[0] == "V1_SWAP_TEST", "Production schema should contain V1 data"
+
+        # 3. The staging schema should have been cleaned up.
+        cur.execute("SELECT 1 FROM pg_namespace WHERE nspname = %s", (db_adapter.staging_schema,))
+        assert cur.fetchone() is None, "Staging schema should be dropped even on swap failure"
+
+        # 4. No 'old' schema from the failed run should exist.
+        # The rename of production to old_production should have been rolled back.
+        cur.execute("SELECT nspname FROM pg_namespace WHERE nspname LIKE %s", (f"{db_adapter.production_schema}_old_%",))
+        archived_schemas = [row[0] for row in cur.fetchall()]
+        assert not any("V2_SWAP_TEST_FAIL" in s for s in archived_schemas), "No archive schema from the failed run should exist"
+
+
 @pytest.fixture
 def sample_xml_empty_file(tmp_path: Path) -> Path:
     """Creates a gzipped, completely empty file."""

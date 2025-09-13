@@ -355,7 +355,6 @@ def _transform_single_threaded(xml_file: Path, output_dir: Path, profile: str) -
     # Sets for de-duplication
     seen_taxonomy_ids: set[int] = set()
     seen_protein_accessions: set[str] = set()
-    duplicate_accessions: set[str] = set()
 
     with (
         FileWriterManager(output_dir) as writers,

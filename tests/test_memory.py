@@ -1,5 +1,4 @@
 import gzip
-import os
 import tracemalloc
 from pathlib import Path
 

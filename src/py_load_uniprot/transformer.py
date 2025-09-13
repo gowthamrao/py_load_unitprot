@@ -90,10 +90,9 @@ def _worker_parse_entry(
             elem = etree.fromstring(xml_string)
             parsed_data = _parse_entry(elem, profile)
             results_queue.put(parsed_data)
-        except etree.XMLSyntaxError:
-            # Handle potential errors in XML snippets
-            # In a real-world scenario, you might log this
-            results_queue.put({})  # Put an empty dict to not stall the writer
+        except Exception as e:
+            # Propagate any exception to the writer process
+            results_queue.put(e)
 
 
 def _parse_entry(elem: etree._Element, profile: str) -> dict[str, list[Any]]:
@@ -250,6 +249,7 @@ def _writer_process(
     output_dir: Path,
     total_entries: int,
     num_workers: int,
+    error_event: multiprocessing.Event,
 ) -> None:
     """
     Writer process function.
@@ -260,7 +260,6 @@ def _writer_process(
     # Use sets to efficiently handle duplicate entries, as they are common
     seen_taxonomy_ids: set[int] = set()
     seen_protein_accessions: set[str] = set()
-    duplicate_accessions: set[str] = set()
 
     with (
         FileWriterManager(output_dir) as writers,
@@ -274,14 +273,21 @@ def _writer_process(
         task = progress.add_task("Parsing...", total=total_entries)
 
         while processed_count < total_entries:
+            if error_event.is_set():
+                break
+
             parsed_data = results_queue.get()
-            if not parsed_data:  # Handle empty dicts from parse errors
+
+            if isinstance(parsed_data, Exception):
+                error_event.set()
+                logging.error(f"Worker process failed: {parsed_data}")
+                break
+
+            if not parsed_data:
                 processed_count += 1
                 progress.update(task, advance=1)
                 continue
 
-            # De-duplication logic is now at the entry level.
-            # If the protein is a duplicate, we skip the entire entry.
             protein_row = parsed_data.get("proteins", [[]])[0]
             if not protein_row:
                 processed_count += 1
@@ -290,19 +296,14 @@ def _writer_process(
 
             accession = protein_row[0]
             if accession in seen_protein_accessions:
-                # Instead of just warning, we raise an error to fail the pipeline.
-                # Silently dropping data can be dangerous.
-                raise ValueError(
-                    f"Duplicate primary accession '{accession}' found in the same input file. "
-                    "Source data must be clean. Halting pipeline."
-                )
+                logging.error(f"Duplicate primary accession '{accession}' found.")
+                error_event.set()
+                break
 
             seen_protein_accessions.add(accession)
 
-            # If not a duplicate, write all data for this entry
             for table_name, rows in parsed_data.items():
                 if table_name == "taxonomy":
-                    # Taxonomy still needs its own de-duplication as it's shared across entries
                     unique_tax_rows = []
                     for row in rows:
                         tax_id = row[0]
@@ -443,10 +444,17 @@ def transform_xml_to_tsv(
     with multiprocessing.Manager() as manager:
         tasks_queue = manager.Queue(maxsize=num_workers_actual * 4)
         results_queue = manager.Queue()
+        error_event = manager.Event()
 
         writer = multiprocessing.Process(
             target=_writer_process,
-            args=(results_queue, output_dir, total_entries, num_workers_actual),
+            args=(
+                results_queue,
+                output_dir,
+                total_entries,
+                num_workers_actual,
+                error_event,
+            ),
         )
         writer.start()
 
@@ -460,6 +468,8 @@ def transform_xml_to_tsv(
             for event, elem in etree.iterparse(
                 f_in, events=("end",), tag=_get_tag("entry")
             ):
+                if error_event.is_set():
+                    break
                 xml_string = etree.tostring(elem, encoding="unicode")
                 tasks_queue.put(xml_string)
                 elem.clear()
@@ -471,6 +481,22 @@ def transform_xml_to_tsv(
 
         pool.close()
         pool.join()
+
+        # Check for error event before joining writer
+        if error_event.is_set():
+            # Terminate writer and cleanup queues
+            writer.terminate()
+            writer.join()
+            # Drain queues to prevent hangs
+            while not tasks_queue.empty():
+                tasks_queue.get_nowait()
+            while not results_queue.empty():
+                results_queue.get_nowait()
+            raise ValueError(
+                "Duplicate primary accession found in the input file. "
+                "See logs for the duplicate accession."
+            )
+
         writer.join()
 
     print("[bold green]Parallel transformation complete.[/bold green]")

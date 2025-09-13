@@ -5,7 +5,7 @@
 groups = ["default", "dev"]
 strategy = ["inherit_metadata"]
 lock_version = "4.5.0"
-content_hash = "sha256:18a145552f2c7f575be18397a9bcfba62ff357f2ba190ee12c58c49f8118f0cf"
+content_hash = "sha256:c85effb4dc75c1e8410a6a37d56c4c5b756c6360ca314634a3f81ef0583551e0"
 
 [[metadata.targets]]
 requires_python = "==3.12.*"
@@ -96,6 +96,25 @@ files = [
 ]
 
 [[package]]
+name = "codecov-cli"
+version = "11.2.0"
+requires_python = ">=3.9"
+summary = "Codecov Command Line Interface"
+groups = ["dev"]
+dependencies = [
+    "PyYAML==6.*",
+    "click==8.*",
+    "ijson==3.*",
+    "responses==0.21.*",
+    "sentry-sdk==2.*",
+    "test-results-parser==0.5.4",
+]
+files = [
+    {file = "codecov_cli-11.2.0-py3-none-any.whl", hash = "sha256:261a51a824e10f375030e460b00b191abf4546d9b0436bc7379f35f878d4c43d"},
+    {file = "codecov_cli-11.2.0.tar.gz", hash = "sha256:38d5ee3d3178526cddaaac12587fee3b61a9923a700797cee33de82bc3e90e12"},
+]
+
+[[package]]
 name = "colorama"
 version = "0.4.6"
 requires_python = "!=3.0.*,!=3.1.*,!=3.2.*,!=3.3.*,!=3.4.*,!=3.5.*,!=3.6.*,>=2.7"
@@ -181,6 +200,27 @@ groups = ["default", "dev"]
 files = [
     {file = "idna-3.10-py3-none-any.whl", hash = "sha256:946d195a0d259cbba61165e88e65941f16e9b36ea6ddb97f00452bae8b1287d3"},
     {file = "idna-3.10.tar.gz", hash = "sha256:12f65c9b470abda6dc35cf8e63cc574b1c52b11df2c86030af0ac09b01b13ea9"},
+]
+
+[[package]]
+name = "ijson"
+version = "3.4.0"
+requires_python = ">=3.9"
+summary = "Iterative JSON parser with standard Python iterator interfaces"
+groups = ["dev"]
+files = [
+    {file = "ijson-3.4.0-cp312-cp312-macosx_10_13_universal2.whl", hash = "sha256:956b148f88259a80a9027ffbe2d91705fae0c004fbfba3e5a24028fbe72311a9"},
+    {file = "ijson-3.4.0-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:06b89960f5c721106394c7fba5760b3f67c515b8eb7d80f612388f5eca2f4621"},
+    {file = "ijson-3.4.0-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:9a0bb591cf250dd7e9dfab69d634745a7f3272d31cfe879f9156e0a081fd97ee"},
+    {file = "ijson-3.4.0-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:72e92de999977f4c6b660ffcf2b8d59604ccd531edcbfde05b642baf283e0de8"},
+    {file = "ijson-3.4.0-cp312-cp312-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:9e9602157a5b869d44b6896e64f502c712a312fcde044c2e586fccb85d3e316e"},
+    {file = "ijson-3.4.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:b1e83660edb931a425b7ff662eb49db1f10d30ca6d4d350e5630edbed098bc01"},
+    {file = "ijson-3.4.0-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:49bf8eac1c7b7913073865a859c215488461f7591b4fa6a33c14b51cb73659d0"},
+    {file = "ijson-3.4.0-cp312-cp312-musllinux_1_2_i686.whl", hash = "sha256:160b09273cb42019f1811469508b0a057d19f26434d44752bde6f281da6d3f32"},
+    {file = "ijson-3.4.0-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:2019ff4e6f354aa00c76c8591bd450899111c61f2354ad55cc127e2ce2492c44"},
+    {file = "ijson-3.4.0-cp312-cp312-win32.whl", hash = "sha256:931c007bf6bb8330705429989b2deed6838c22b63358a330bf362b6e458ba0bf"},
+    {file = "ijson-3.4.0-cp312-cp312-win_amd64.whl", hash = "sha256:71523f2b64cb856a820223e94d23e88369f193017ecc789bb4de198cc9d349eb"},
+    {file = "ijson-3.4.0.tar.gz", hash = "sha256:5f74dcbad9d592c428d3ca3957f7115a42689ee7ee941458860900236ae9bb13"},
 ]
 
 [[package]]
@@ -527,7 +567,7 @@ name = "pyyaml"
 version = "6.0.2"
 requires_python = ">=3.8"
 summary = "YAML parser and emitter for Python"
-groups = ["default"]
+groups = ["default", "dev"]
 files = [
     {file = "PyYAML-6.0.2-cp312-cp312-macosx_10_9_x86_64.whl", hash = "sha256:c70c95198c015b85feafc136515252a261a84561b7b1d51e3384e0655ddf25ab"},
     {file = "PyYAML-6.0.2-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:ce826d6ef20b1bc864f0a68340c8b3287705cae2f8b4b1d932177dcc76721725"},
@@ -556,6 +596,22 @@ dependencies = [
 files = [
     {file = "requests-2.32.5-py3-none-any.whl", hash = "sha256:2462f94637a34fd532264295e186976db0f5d453d1cdd31473c85a6a161affb6"},
     {file = "requests-2.32.5.tar.gz", hash = "sha256:dbba0bac56e100853db0ea71b82b4dfd5fe2bf6d3754a8893c3af500cec7d7cf"},
+]
+
+[[package]]
+name = "responses"
+version = "0.21.0"
+requires_python = ">=3.7"
+summary = "A utility library for mocking out the `requests` Python library."
+groups = ["dev"]
+dependencies = [
+    "requests<3.0,>=2.0",
+    "typing-extensions; python_version < \"3.8\"",
+    "urllib3>=1.25.10",
+]
+files = [
+    {file = "responses-0.21.0-py3-none-any.whl", hash = "sha256:2dcc863ba63963c0c3d9ee3fa9507cbe36b7d7b0fccb4f0bdfd9e96c539b1487"},
+    {file = "responses-0.21.0.tar.gz", hash = "sha256:b82502eb5f09a0289d8e209e7bad71ef3978334f56d09b444253d5ad67bf5253"},
 ]
 
 [[package]]
@@ -602,6 +658,21 @@ files = [
 ]
 
 [[package]]
+name = "sentry-sdk"
+version = "2.37.1"
+requires_python = ">=3.6"
+summary = "Python client for Sentry (https://sentry.io)"
+groups = ["dev"]
+dependencies = [
+    "certifi",
+    "urllib3>=1.26.11",
+]
+files = [
+    {file = "sentry_sdk-2.37.1-py2.py3-none-any.whl", hash = "sha256:baaaea6608ed3a639766a69ded06b254b106d32ad9d180bdbe58f3db9364592b"},
+    {file = "sentry_sdk-2.37.1.tar.gz", hash = "sha256:531751da91aa62a909b42a7be155b41f6bb0de9df6ae98441d23b95de2f98475"},
+]
+
+[[package]]
 name = "shellingham"
 version = "1.5.4"
 requires_python = ">=3.7"
@@ -610,6 +681,29 @@ groups = ["default"]
 files = [
     {file = "shellingham-1.5.4-py2.py3-none-any.whl", hash = "sha256:7ecfff8f2fd72616f7481040475a65b2bf8af90a56c89140852d1120324e8686"},
     {file = "shellingham-1.5.4.tar.gz", hash = "sha256:8dbca0739d487e5bd35ab3ca4b36e11c4078f3a234bfce294b0a0291363404de"},
+]
+
+[[package]]
+name = "test-results-parser"
+version = "0.5.4"
+requires_python = ">=3.8"
+summary = ""
+groups = ["dev"]
+files = [
+    {file = "test_results_parser-0.5.4-cp312-cp312-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl", hash = "sha256:f11c38582fe954cd11b422b291c84899da123a7ff19b90ac0e32ba0a4a0e6115"},
+    {file = "test_results_parser-0.5.4-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:41c2c944db22efdc9f97fe1335f98beb30afb3c1af0208f678bdce0831dac1eb"},
+    {file = "test_results_parser-0.5.4-cp312-cp312-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:6559b8417f67b5cbf8ef8d19e71a006b91e1a58ebf08bfa5abb537138c33aad1"},
+    {file = "test_results_parser-0.5.4-cp312-cp312-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:b2e4b01acdd467fc4270d6003593713197b22cea2ce4e95cfc8dd6652ed27e4e"},
+    {file = "test_results_parser-0.5.4-cp312-cp312-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:54d523cbe643efdc290f3e450f9017580b0effe2019f8179925e1688b8242590"},
+    {file = "test_results_parser-0.5.4-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:e087340da87ff8a3c20f6d33f2a9ca6355c75d11f0de63249acfa3a188339b24"},
+    {file = "test_results_parser-0.5.4-cp312-cp312-manylinux_2_5_i686.manylinux1_i686.whl", hash = "sha256:1fc29ea06517e31e53bdc8e89a9311ebd6621a7774fd3f99fb8c8c2b7fbe761c"},
+    {file = "test_results_parser-0.5.4-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:771939c4542b6c1f54b86f3db4499a2d61250ff81602b76cc6a5f6e09a78dea5"},
+    {file = "test_results_parser-0.5.4-cp312-cp312-musllinux_1_2_armv7l.whl", hash = "sha256:961b1caa1e095e5ff9dfa9b2cd1033394ecaa0649e5276f3bec521e9eb0b621a"},
+    {file = "test_results_parser-0.5.4-cp312-cp312-musllinux_1_2_i686.whl", hash = "sha256:3714164aef996c137dd4b93711b7c07854c314f210343ac115d8672365a6723f"},
+    {file = "test_results_parser-0.5.4-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:7ba3a7883b0fc1102a1306c2fb9e2ab65f6c9e47ff7136a16142694fce08aafb"},
+    {file = "test_results_parser-0.5.4-cp312-cp312-win32.whl", hash = "sha256:b2db33a1ab9b6e469f39a661c5807602562e96111a6d887692f4312bb9932500"},
+    {file = "test_results_parser-0.5.4-cp312-cp312-win_amd64.whl", hash = "sha256:397ddb2285dc27e47f1785bd6239e80bdc632db99abe1f2698c1aa46c3bc5479"},
+    {file = "test_results_parser-0.5.4.tar.gz", hash = "sha256:2fbfd809a2c1f746360146809b6df30690c992463d7d43e7b1fed31c1a7c15b4"},
 ]
 
 [[package]]

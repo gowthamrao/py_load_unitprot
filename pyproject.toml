@@ -11,17 +11,6 @@ readme = "README.md"
 license = {text = "MIT"}
 
 
-[tool.pdm]
-distribution = false
-
-[tool.pdm.scripts]
-pytest = "pytest"
-lint = "ruff check ."
-format = "black ."
-types = "mypy src"
-test-cov = 'sh -c "COVERAGE_PROCESS_START=pyproject.toml coverage run --parallel -m pytest && coverage combine && coverage report"'
-
-
 [project.scripts]
 py_load_unitprot = "py_load_uniprot.cli:main"
 
@@ -53,6 +42,17 @@ python_version = "3.12"
 strict = true
 ignore_missing_imports = true
 
+[tool.pdm]
+distribution = false
+
+[tool.pdm.scripts]
+pytest = "pytest"
+lint = "ruff check ."
+format = "black ."
+types = "mypy src"
+test-cov = 'sh -c "COVERAGE_PROCESS_START=pyproject.toml coverage run --parallel -m pytest && coverage combine && coverage report && codecov-cli do-upload"'
+
+
 [dependency-groups]
 dev = [
     "pytest>=8.4.2",
@@ -65,4 +65,5 @@ dev = [
     "types-requests>=2.32.0.20240712",
     "types-PyYAML>=6.0.12.20240712",
     "memory-profiler>=0.61.0",
+    "codecov-cli>=11.2.0",
 ]

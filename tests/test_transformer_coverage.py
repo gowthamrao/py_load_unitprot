@@ -162,3 +162,115 @@ def test_element_to_json():
     assert data[0]["tag"] == "child"
     assert data[0]["attributes"]["attribute"] == "value"
     assert data[0]["text"] == "text"
+
+
+def test_writer_process_writes_data(tmp_path: Path):
+    """
+    Tests that the _writer_process function correctly writes data from the
+    results queue to the appropriate TSV files.
+    """
+    # Arrange
+    output_dir = tmp_path / "output"
+    # Can't use multiprocessing.Manager in a test, so use standard Queue
+    results_queue = transformer.multiprocessing.Queue()
+    error_event = transformer.multiprocessing.Event()
+    total_entries = 2
+
+    # Add some sample parsed data to the queue
+    results_queue.put({
+        "proteins": [["P12345", "ID1", "PROT1", 9606, 10, 100, "d1", "d2", "{}", "{}", "{}", "{}"]],
+        "sequences": [["P12345", "SEQ1"]],
+        "accessions": [["P12345", "S1"]],
+        "genes": [["P12345", "GENE1", True]],
+        "keywords": [["P12345", "KW1", "Keyword 1"]],
+    })
+    results_queue.put({
+        "proteins": [["P67890", "ID2", "PROT2", 10090, 20, 200, "d3", "d4", "{}", "{}", "{}", "{}"]],
+        "taxonomy": [[10090, "Mus musculus", "lineage"]],
+        "protein_to_go": [["P67890", "GO:1234"]],
+        "genes": [["P67890", "GENE2", False]],
+        "keywords": [["P67890", "KW2", "Keyword 2"]],
+    })
+
+    # Act
+    transformer._writer_process(results_queue, output_dir, total_entries, 1, error_event)
+
+    # Assert
+    # Check that the files are created and have the correct content
+    proteins_file = output_dir / "proteins.tsv.gz"
+    sequences_file = output_dir / "sequences.tsv.gz"
+    accessions_file = output_dir / "accessions.tsv.gz"
+    taxonomy_file = output_dir / "taxonomy.tsv.gz"
+    go_file = output_dir / "protein_to_go.tsv.gz"
+
+    assert proteins_file.exists()
+    assert sequences_file.exists()
+    assert accessions_file.exists()
+    assert taxonomy_file.exists()
+    assert go_file.exists()
+
+    # A helper to read gzipped tsv files
+    def read_gz_tsv(path):
+        with gzip.open(path, "rt") as f:
+            return [line.strip().split("	") for line in f]
+
+    proteins_content = read_gz_tsv(proteins_file)
+    assert len(proteins_content) == 3  # Header + 2 rows
+    assert proteins_content[1] == ["P12345", "ID1", "PROT1", "9606", "10", "100", "d1", "d2", "{}", "{}", "{}", "{}"]
+
+    sequences_content = read_gz_tsv(sequences_file)
+    assert len(sequences_content) == 2  # Header + 1 row
+    assert sequences_content[1] == ["P12345", "SEQ1"]
+
+
+def test_writer_process_handles_exceptions(tmp_path: Path):
+    """
+    Tests that the _writer_process function correctly handles an exception
+    passed through the results queue.
+    """
+    # Arrange
+    output_dir = tmp_path / "output"
+    results_queue = transformer.multiprocessing.Queue()
+    error_event = transformer.multiprocessing.Event()
+    total_entries = 1
+
+    # Put an exception on the queue
+    results_queue.put(ValueError("Test worker error"))
+
+    # Act
+    transformer._writer_process(results_queue, output_dir, total_entries, 1, error_event)
+
+    # Assert
+    assert error_event.is_set()
+    assert output_dir.exists()
+
+    # Check that files were created, but contain only the header
+    proteins_file = output_dir / "proteins.tsv.gz"
+    assert proteins_file.exists()
+
+    with gzip.open(proteins_file, "rt") as f:
+        lines = f.readlines()
+        assert len(lines) == 1
+        assert lines[0].strip() == "	".join(transformer.TABLE_HEADERS["proteins"])
+
+
+def test_worker_parse_entry_exception(mocker):
+    """
+    Tests that _worker_parse_entry correctly catches an exception during parsing
+    and puts it on the results queue.
+    """
+    # Arrange
+    tasks_queue = transformer.multiprocessing.Queue()
+    results_queue = transformer.multiprocessing.Queue()
+    tasks_queue.put("<malformed_xml>")
+    tasks_queue.put(None)  # Sentinel
+
+    mocker.patch('lxml.etree.fromstring', side_effect=ValueError("Malformed XML"))
+
+    # Act
+    transformer._worker_parse_entry(tasks_queue, results_queue, "full")
+
+    # Assert
+    result = results_queue.get()
+    assert isinstance(result, ValueError)
+    assert "Malformed XML" in str(result)

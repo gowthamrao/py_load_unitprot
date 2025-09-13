@@ -970,13 +970,12 @@ def sample_xml_duplicate_accession_file(tmp_path: Path) -> Path:
 
 
 @pytest.mark.parametrize("settings", [{"num_workers": 1}], indirect=True)
-def test_pipeline_handles_duplicate_accessions_in_source(
-    settings: Settings, db_adapter: PostgresAdapter, sample_xml_duplicate_accession_file: Path, mocker, caplog
+def test_pipeline_fails_on_duplicate_accessions_in_source(
+    settings: Settings, db_adapter: PostgresAdapter, sample_xml_duplicate_accession_file: Path, mocker
 ):
     """
     Tests that if a source XML file contains duplicate primary accessions,
-    the pipeline's de-duplication step correctly handles it by loading only
-    one version and logging a warning.
+    the pipeline now fails with a ValueError instead of silently logging.
     """
     # --- Arrange ---
     settings.data_dir = sample_xml_duplicate_accession_file.parent
@@ -997,25 +996,24 @@ def test_pipeline_handles_duplicate_accessions_in_source(
     pipeline.db_adapter.production_schema = db_adapter.production_schema
     pipeline.db_adapter.staging_schema = db_adapter.staging_schema
 
-    # --- Act ---
-    logging.basicConfig(level=logging.WARNING)
-    with caplog.at_level(logging.WARNING):
+    # --- Act & Assert ---
+    # The pipeline should now raise a ValueError due to the duplicate accession.
+    with pytest.raises(ValueError, match="Duplicate primary accession 'P12345'"):
         pipeline.run(dataset="swissprot", mode="full")
 
-    # --- Assert ---
-    # 1. Check that a warning was logged
-    assert "Found 1 duplicate primary accessions" in caplog.text
-    assert "P12345" in caplog.text
-
-    # 2. Check that only one of the proteins was loaded and it's the first one.
+    # --- Assert that the database is clean ---
+    # The staging schema should have been cleaned up, and no production schema created.
     with postgres_connection(settings) as conn, conn.cursor() as cur:
-        prod_schema = pipeline.db_adapter.production_schema
         cur.execute(
-            f"SELECT uniprot_id FROM {prod_schema}.proteins WHERE primary_accession = 'P12345'"
+            "SELECT 1 FROM pg_namespace WHERE nspname = %s",
+            (pipeline.db_adapter.staging_schema,),
         )
-        result = cur.fetchall()
-        assert len(result) == 1, "Only one protein with accession P12345 should be loaded"
-        assert result[0][0] == "TEST1_HUMAN_V1", "The first seen duplicate entry should be the one loaded"
+        assert cur.fetchone() is None, "Staging schema should be dropped on failure"
+        cur.execute(
+            "SELECT 1 FROM pg_namespace WHERE nspname = %s",
+            (pipeline.db_adapter.production_schema,),
+        )
+        assert cur.fetchone() is None, "Production schema should not be created on failure"
 
 
 def test_delta_load_primary_accession_change(
@@ -1366,3 +1364,133 @@ def test_etl_profiles_standard_vs_full(
         assert features is not None and len(features) > 0, "Features should be loaded"
         assert db_refs is not None and len(db_refs) > 0, "DB References should be loaded"
         assert evidence is not None and len(evidence) > 0, "Evidence should be loaded"
+
+
+# V4: P12345 and P67890 are both updated to have the same new primary accession,
+# which should cause a unique constraint violation during the delta load.
+SAMPLE_XML_V4_CONFLICT_CONTENT = """<?xml version="1.0" encoding="UTF-8"?>
+<uniprot xmlns="http://uniprot.org/uniprot">
+<!-- Update P12345 to a new accession -->
+<entry dataset="Swiss-Prot" created="2000-05-30" modified="2025-03-01" version="153">
+  <accession>CONFLICT01</accession>
+  <accession>P12345</accession>
+  <name>TEST1_HUMAN</name>
+  <protein><recommendedName><fullName>Test protein 1 - Conflict</fullName></recommendedName></protein>
+  <sequence length="10" mass="1111">MTESTSEQAA</sequence>
+</entry>
+<!-- Update P67890 to the *same* new accession -->
+<entry dataset="TrEMBL" created="2010-10-12" modified="2025-03-01" version="101">
+  <accession>CONFLICT01</accession>
+  <accession>P67890</accession>
+  <name>TEST2_MOUSE</name>
+  <protein><recommendedName><fullName>Test protein 2 - Conflict</fullName></recommendedName></protein>
+  <sequence length="12" mass="2222">MTESTSEQBBBB</sequence>
+</entry>
+</uniprot>
+"""
+
+
+@pytest.fixture
+def sample_xml_v4_conflict_file(tmp_path: Path) -> Path:
+    """Creates a gzipped sample V4 XML file for testing a delta load conflict."""
+    xml_path = tmp_path / "sample_v4_conflict.xml.gz"
+    with gzip.open(xml_path, "wt", encoding="utf-8") as f:
+        f.write(SAMPLE_XML_V4_CONFLICT_CONTENT)
+    return xml_path
+
+
+@pytest.mark.parametrize("settings", [{"num_workers": 1}], indirect=True)
+def test_delta_load_handles_conflicting_accession_change(
+    settings: Settings,
+    db_adapter: PostgresAdapter,
+    sample_xml_file: Path,
+    sample_xml_v4_conflict_file: Path,
+    mocker,
+):
+    """
+    Tests that a delta load transaction is rolled back if it contains data
+    that violates a unique constraint (e.g., two proteins updated to have the
+    same new primary accession).
+    """
+    # --- Arrange ---
+    settings.data_dir = sample_xml_file.parent
+    sprot_file = settings.data_dir / "uniprot_sprot.xml.gz"
+    sample_xml_file.rename(sprot_file)
+    pipeline = PyLoadUniprotPipeline(settings)
+    pipeline.db_adapter.production_schema = db_adapter.production_schema
+    pipeline.db_adapter.staging_schema = db_adapter.staging_schema
+
+    # --- Act 1: Initial Full Load ---
+    print("--- Running Initial Full Load for Conflict Test ---")
+    mocker.patch.object(
+        extractor.Extractor,
+        "get_release_info",
+        return_value={
+            "version": "V1_CONFLICT_TEST",
+            "release_date": datetime.date(2025, 3, 1),
+            "swissprot_entry_count": 2,
+            "trembl_entry_count": 0,
+        },
+    )
+    pipeline.run(dataset="swissprot", mode="full")
+
+    # --- Assert 1: Verify initial state ---
+    with postgres_connection(settings) as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT COUNT(*) FROM {db_adapter.production_schema}.proteins")
+        assert cur.fetchone()[0] == 2
+        cur.execute(
+            f"SELECT uniprot_id FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'"
+        )
+        assert cur.fetchone()[0] == "TEST1_HUMAN"
+
+    # --- Act 2: Attempt Delta Load with conflicting data ---
+    print("--- Running Delta Load with Conflicting Accession Changes ---")
+    sprot_file.rename(settings.data_dir / "uniprot_sprot_v1.xml.gz")
+    sample_xml_v4_conflict_file.rename(sprot_file)
+    mocker.patch.object(
+        extractor.Extractor,
+        "get_release_info",
+        return_value={
+            "version": "V4_CONFLICT_TEST",
+            "release_date": datetime.date(2025, 3, 2),
+            "swissprot_entry_count": 2,
+            "trembl_entry_count": 0,
+        },
+    )
+
+    # The pipeline should fail with a ValueError from the transformer
+    # due to the duplicate primary accession in the source file.
+    with pytest.raises(ValueError, match="Duplicate primary accession 'CONFLICT01'"):
+        pipeline.run(dataset="swissprot", mode="delta")
+
+    # --- Assert 2: Verify that the database state was rolled back ---
+    print("--- Verifying database state after failed delta load ---")
+    with postgres_connection(settings) as conn, conn.cursor() as cur:
+        # The total number of proteins should still be 2
+        cur.execute(f"SELECT COUNT(*) FROM {db_adapter.production_schema}.proteins")
+        assert cur.fetchone()[0] == 2, "Protein count should be unchanged after failed delta."
+
+        # The conflicting accession should not exist
+        cur.execute(
+            f"SELECT 1 FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'CONFLICT01'"
+        )
+        assert cur.fetchone() is None, "Conflicting accession should not have been inserted."
+
+        # The original protein should be untouched
+        cur.execute(
+            f"SELECT uniprot_id, protein_name FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'"
+        )
+        row = cur.fetchone()
+        assert row is not None
+        assert row[0] == "TEST1_HUMAN"
+        assert row[1] == "Test protein 1", "Protein name should not have been updated."
+
+        # The other original protein should also be untouched
+        cur.execute(
+            f"SELECT 1 FROM {db_adapter.production_schema}.proteins WHERE primary_accession = 'P67890'"
+        )
+        assert cur.fetchone() is not None, "Original protein P67890 should still exist."
+
+        # Metadata should not have been updated
+        cur.execute(f"SELECT version FROM {db_adapter.production_schema}.py_load_uniprot_metadata")
+        assert cur.fetchone()[0] == "V1_CONFLICT_TEST", "Metadata version should be unchanged."

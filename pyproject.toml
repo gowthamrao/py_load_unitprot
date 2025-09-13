@@ -19,6 +19,7 @@ pytest = "pytest"
 lint = "ruff check ."
 format = "black ."
 types = "mypy src"
+test-cov = 'sh -c "COVERAGE_PROCESS_START=pyproject.toml coverage run --parallel -m pytest && coverage combine && coverage report"'
 
 
 [project.scripts]
@@ -28,6 +29,13 @@ py_load_unitprot = "py_load_uniprot.cli:main"
 pythonpath = [
   "src"
 ]
+
+[tool.coverage.run]
+parallel = true
+source = ["src"]
+
+[tool.coverage.report]
+show_missing = true
 
 [tool.black]
 line-length = 88

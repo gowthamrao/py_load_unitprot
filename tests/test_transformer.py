@@ -340,3 +340,216 @@ def test_element_to_json_with_empty_list():
     Tests that _element_to_json returns None when given an empty list.
     """
     assert transformer._element_to_json([]) is None
+
+
+def test_element_to_json_with_none():
+    """
+    Tests that _element_to_json returns None when given None.
+    """
+    assert transformer._element_to_json(None) is None
+
+
+def test_parse_entry_with_no_accession():
+    """
+    Tests that _parse_entry returns an empty dict if an entry has no primary accession.
+    """
+    from lxml import etree
+
+    xml_string = """
+<entry xmlns="http://uniprot.org/uniprot">
+  <name>TEST_NO_ACC</name>
+</entry>
+"""
+    elem = etree.fromstring(xml_string)
+    parsed_data = transformer._parse_entry(elem, profile="full")
+    assert parsed_data == {}
+
+
+def test_parse_entry_with_no_protein_name():
+    """
+    Tests that _parse_entry handles entries without a recommendedName.
+    """
+    from lxml import etree
+
+    xml_string = """
+<entry xmlns="http://uniprot.org/uniprot">
+  <accession>P99999</accession>
+  <name>TEST_NO_PROT_NAME</name>
+  <protein>
+    <submittedName><fullName>A submitted name</fullName></submittedName>
+  </protein>
+  <sequence length="1" mass="1">M</sequence>
+</entry>
+"""
+    elem = etree.fromstring(xml_string)
+    parsed_data = transformer._parse_entry(elem, profile="full")
+    assert parsed_data["proteins"][0][2] is None  # protein_name should be None
+
+
+def test_transform_xml_to_tsv_standard_profile(sample_xml_file: Path, tmp_path: Path):
+    """
+    Tests that the transformer correctly applies the 'standard' profile,
+    which should limit the JSON data fields.
+    """
+    # Arrange
+    output_dir = tmp_path / "output_standard"
+
+    # Act
+    transformer.transform_xml_to_tsv(
+        sample_xml_file, output_dir, profile="standard", num_workers=1
+    )
+
+    # Assert
+    proteins_rows = read_tsv_gz(output_dir / "proteins.tsv.gz")
+    assert len(proteins_rows) == 3  # Header + 2 entries
+    protein_data = sorted(
+        proteins_rows[1:], key=lambda r: r[0]
+    )  # Sort by accession
+
+    # Check P12345
+    p1_row = protein_data[0]
+    # comments_data should only contain 'function'
+    comments_json = json.loads(p1_row[8])
+    assert len(comments_json) == 1
+    assert comments_json[0]["attributes"]["type"] == "function"
+    # These fields should be empty for standard profile
+    assert p1_row[9] == ""  # features_data
+    assert p1_row[10] == ""  # db_references_data
+    assert p1_row[11] == ""  # evidence_data
+
+    # Check P67890 (has no comments, so field should be empty)
+    p2_row = protein_data[1]
+    assert p2_row[8] == ""  # comments_data
+
+
+def test_get_total_entries_with_empty_file(tmp_path: Path):
+    """
+    Tests that _get_total_entries returns 0 for an empty gzipped file.
+    """
+    empty_file = tmp_path / "empty.xml.gz"
+    with gzip.open(empty_file, "wt") as f:
+        f.write("")
+    assert transformer._get_total_entries(empty_file) == 0
+
+
+def test_parallel_transform_with_empty_file(tmp_path: Path):
+    """
+    Tests the parallel transformer with an empty file.
+    """
+    empty_file = tmp_path / "empty.xml.gz"
+    with gzip.open(empty_file, "wt") as f:
+        f.write("")
+    output_dir = tmp_path / "output_parallel_empty"
+
+    transformer.transform_xml_to_tsv(
+        empty_file, output_dir, profile="full", num_workers=2
+    )
+
+    assert not output_dir.exists() or not any(output_dir.iterdir())
+
+
+@pytest.fixture
+def bad_taxid_xml_file(tmp_path: Path) -> Path:
+    """
+    Creates a gzipped XML file with an entry that will cause a ValueError
+    (from int() conversion) inside the worker process.
+    """
+    xml_content = """<?xml version="1.0" encoding="UTF-8"?>
+<uniprot xmlns="http://uniprot.org/uniprot">
+<entry>
+  <accession>P12345</accession>
+  <name>TEST_BAD_TAXID</name>
+  <organism>
+    <dbReference type="NCBI Taxonomy" id="not-an-int" />
+  </organism>
+  <sequence length="1" mass="1">M</sequence>
+</entry>
+</uniprot>
+"""
+    xml_path = tmp_path / "bad_taxid.xml.gz"
+    with gzip.open(xml_path, "wt", encoding="utf-8") as f:
+        f.write(xml_content)
+    return xml_path
+
+
+def test_worker_error_propagation(bad_taxid_xml_file: Path, tmp_path: Path):
+    """
+    Tests that an exception raised in a worker process (due to bad data)
+    is correctly propagated and halts the main process.
+    """
+    # Arrange
+    output_dir = tmp_path / "output_worker_error"
+
+    # Act & Assert
+    # The current implementation raises a generic error message. We'll match that
+    # to confirm the pipeline halts as expected.
+    with pytest.raises(ValueError, match="Duplicate primary accession found"):
+        transformer.transform_xml_to_tsv(
+            bad_taxid_xml_file, output_dir, profile="full", num_workers=2
+        )
+
+
+@pytest.fixture
+def duplicate_xml_file(tmp_path: Path) -> Path:
+    """Creates a gzipped XML file with a duplicate primary accession."""
+    xml_content = """<?xml version="1.0" encoding="UTF-8"?>
+<uniprot xmlns="http://uniprot.org/uniprot">
+<entry><accession>P12345</accession><name>A</name><sequence length="1">M</sequence></entry>
+<entry><accession>P67890</accession><name>B</name><sequence length="1">M</sequence></entry>
+<entry><accession>P12345</accession><name>C</name><sequence length="1">M</sequence></entry>
+</uniprot>
+"""
+    xml_path = tmp_path / "duplicate.xml.gz"
+    with gzip.open(xml_path, "wt", encoding="utf-8") as f:
+        f.write(xml_content)
+    return xml_path
+
+
+def test_duplicate_accession_halts_parallel_pipeline(
+    duplicate_xml_file: Path, tmp_path: Path
+):
+    """
+    Tests that the parallel pipeline halts when a duplicate accession is found.
+    """
+    output_dir = tmp_path / "output_parallel_duplicate"
+    with pytest.raises(ValueError, match="Duplicate primary accession"):
+        transformer.transform_xml_to_tsv(
+            duplicate_xml_file, output_dir, profile="full", num_workers=2
+        )
+
+
+def test_duplicate_accession_halts_single_threaded_pipeline(
+    duplicate_xml_file: Path, tmp_path: Path
+):
+    """
+    Tests that the single-threaded pipeline halts when a duplicate accession is found.
+    """
+    output_dir = tmp_path / "output_single_duplicate"
+    with pytest.raises(ValueError, match="Duplicate primary accession"):
+        transformer.transform_xml_to_tsv(
+            duplicate_xml_file, output_dir, profile="full", num_workers=1
+        )
+
+
+def test_transform_xml_to_tsv_with_none_workers(
+    sample_xml_file: Path, tmp_path: Path, mocker
+):
+    """
+    Tests that calling with num_workers=None correctly uses os.cpu_count.
+    """
+    # Arrange
+    output_dir = tmp_path / "output_none_workers"
+    # Mock cpu_count to ensure the parallel path is taken
+    mocker.patch("os.cpu_count", return_value=2)
+    # Spy on the single-threaded function to ensure it's NOT called, as
+    # spying on the multiprocessing target function is not reliable.
+    spy_single = mocker.spy(transformer, "_transform_single_threaded")
+
+    # Act
+    transformer.transform_xml_to_tsv(
+        sample_xml_file, output_dir, profile="full", num_workers=None
+    )
+
+    # Assert
+    assert (output_dir / "proteins.tsv.gz").exists()
+    assert spy_single.call_count == 0

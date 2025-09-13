@@ -226,3 +226,77 @@ def test_download_file_resume_success(
 
     # Check that the file content is correct
     assert local_path.read_bytes() == initial_content + resumed_content
+
+
+@patch("requests.Session.get")
+def test_fetch_checksums_not_found(mock_get: MagicMock, extractor: Extractor):
+    """Test that an empty dict is returned if the checksum file is not found (404)."""
+    # --- Arrange ---
+    mock_response = MagicMock()
+    mock_response.status_code = 404
+    mock_get.return_value = mock_response
+
+    # --- Act ---
+    checksums = extractor.fetch_checksums()
+
+    # --- Assert ---
+    assert checksums == {}
+    assert extractor._checksums == {}
+
+
+@patch("requests.Session.get")
+def test_get_release_info_no_match(mock_get: MagicMock, extractor: Extractor):
+    """Test that an error is raised if the release info has an unexpected format."""
+    # --- Arrange ---
+    mock_response = MagicMock()
+    mock_response.text = "This is not the data you are looking for"
+    mock_response.raise_for_status.return_value = None
+    mock_get.return_value = mock_response
+
+    # --- Act & Assert ---
+    with pytest.raises(ValueError, match="Could not parse release version/date"):
+        extractor.get_release_info()
+
+
+@patch("py_load_uniprot.extractor.Extractor.fetch_checksums", return_value={})
+def test_verify_checksum_no_checksums_available(
+    mock_fetch_checksums: MagicMock, extractor: Extractor, temp_data_dir: Path
+):
+    """Test that verification is skipped if no checksums can be fetched."""
+    # --- Arrange ---
+    file_path = temp_data_dir / "any_file.gz"
+    file_path.write_bytes(b"data")
+    extractor._checksums = None  # Ensure checksums are not cached
+
+    # --- Act ---
+    result = extractor.verify_checksum(file_path)
+
+    # --- Assert ---
+    mock_fetch_checksums.assert_called_once()
+    assert result is True
+
+
+def test_verify_checksum_mismatch(extractor: Extractor, temp_data_dir: Path):
+    """Test checksum verification for a file with a mismatched checksum."""
+    # --- Arrange ---
+    filename = "test_file.gz"
+    content = b"some data"
+    file_path = temp_data_dir / filename
+    file_path.write_bytes(content)
+
+    # Pre-populate the checksums with a wrong checksum
+    extractor._checksums = {filename: "this is a wrong checksum"}
+
+    # --- Act & Assert ---
+    assert extractor.verify_checksum(file_path) is False
+
+
+@patch("requests.Session.get", side_effect=requests.exceptions.RequestException("Test error"))
+def test_fetch_checksums_request_exception(mock_get: MagicMock, extractor: Extractor):
+    """Test that an empty dict is returned if a request exception occurs."""
+    # --- Act ---
+    checksums = extractor.fetch_checksums()
+
+    # --- Assert ---
+    assert checksums == {}
+    assert extractor._checksums == {}

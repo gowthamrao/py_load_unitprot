@@ -316,3 +316,27 @@ def test_parallel_transformer_matches_single_threaded(
         assert (
             single_data == parallel_data
         ), f"Data in {filename} should match after sorting"
+
+
+def test_transform_xml_to_tsv_with_empty_file(tmp_path: Path):
+    """
+    Tests that the transformer correctly handles an empty input file.
+    """
+    # Arrange
+    empty_xml_file = tmp_path / "empty.xml.gz"
+    with gzip.open(empty_xml_file, "wt", encoding="utf-8") as f:
+        f.write("")
+    output_dir = tmp_path / "output"
+
+    # Act
+    transformer.transform_xml_to_tsv(empty_xml_file, output_dir, profile="full", num_workers=1)
+
+    # Assert
+    assert not output_dir.exists() or not any(output_dir.iterdir())
+
+
+def test_element_to_json_with_empty_list():
+    """
+    Tests that _element_to_json returns None when given an empty list.
+    """
+    assert transformer._element_to_json([]) is None

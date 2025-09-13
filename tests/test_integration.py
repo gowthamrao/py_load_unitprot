@@ -1016,6 +1016,76 @@ def test_pipeline_fails_on_duplicate_accessions_in_source(
         assert cur.fetchone() is None, "Production schema should not be created on failure"
 
 
+SAMPLE_XML_COMPLEX_DUPLICATE_CONTENT = """<?xml version="1.0" encoding="UTF-8"?>
+<uniprot xmlns="http://uniprot.org/uniprot">
+<entry><accession>DUPE01</accession><name>D1</name><sequence length="1">A</sequence></entry>
+<entry><accession>UNIQUE01</accession><name>U1</name><sequence length="1">B</sequence></entry>
+<entry><accession>DUPE01</accession><name>D2</name><sequence length="1">C</sequence></entry>
+<entry><accession>UNIQUE02</accession><name>U2</name><sequence length="1">D</sequence></entry>
+<entry><accession>UNIQUE03</accession><name>U3</name><sequence length="1">E</sequence></entry>
+<entry><accession>DUPE01</accession><name>D3</name><sequence length="1">F</sequence></entry>
+</uniprot>
+"""
+
+
+@pytest.fixture
+def sample_xml_complex_duplicate_file(tmp_path: Path) -> Path:
+    """Creates a gzipped sample XML file with multiple duplicate accessions interspersed with unique ones."""
+    xml_path = tmp_path / "sample_complex_duplicate.xml.gz"
+    with gzip.open(xml_path, "wt", encoding="utf-8") as f:
+        f.write(SAMPLE_XML_COMPLEX_DUPLICATE_CONTENT)
+    return xml_path
+
+
+@pytest.mark.parametrize("settings", [{"num_workers": 4}], indirect=True)
+def test_pipeline_fails_on_duplicates_in_multiprocessing(
+    settings: Settings, db_adapter: PostgresAdapter, sample_xml_complex_duplicate_file: Path, mocker
+):
+    """
+    Tests that the duplicate accession check is effective even in a multiprocessing
+    context where entry processing order is non-deterministic.
+    """
+    # --- Arrange ---
+    settings.data_dir = sample_xml_complex_duplicate_file.parent
+    sprot_file = settings.data_dir / "uniprot_sprot.xml.gz"
+    sample_xml_complex_duplicate_file.rename(sprot_file)
+
+    mocker.patch.object(
+        extractor.Extractor,
+        "get_release_info",
+        return_value={
+            "version": "MP_DUPLICATE_TEST",
+            "release_date": datetime.date(2025, 1, 1),
+            "swissprot_entry_count": 6,
+            "trembl_entry_count": 0,
+        },
+    )
+    pipeline = PyLoadUniprotPipeline(settings)
+    # Use distinct schema names to ensure no test interference
+    pipeline.db_adapter.production_schema = "test_mp_duplicates_prod"
+    pipeline.db_adapter.staging_schema = "test_mp_duplicates_staging"
+
+
+    # --- Act & Assert ---
+    # The pipeline should raise a ValueError due to the duplicate accession 'DUPE01'.
+    # This error originates from the writer process.
+    with pytest.raises(ValueError, match="Duplicate primary accession found in the input file"):
+        pipeline.run(dataset="swissprot", mode="full")
+
+    # --- Assert that the database is clean ---
+    with postgres_connection(settings) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM pg_namespace WHERE nspname = %s",
+            (pipeline.db_adapter.staging_schema,),
+        )
+        assert cur.fetchone() is None, "Staging schema should be dropped on failure"
+        cur.execute(
+            "SELECT 1 FROM pg_namespace WHERE nspname = %s",
+            (pipeline.db_adapter.production_schema,),
+        )
+        assert cur.fetchone() is None, "Production schema should not be created on failure"
+
+
 def test_delta_load_primary_accession_change(
     settings: Settings, db_adapter: PostgresAdapter, sample_xml_file: Path, sample_xml_v3_file: Path, mocker
 ):
@@ -1494,3 +1564,120 @@ def test_delta_load_handles_conflicting_accession_change(
         # Metadata should not have been updated
         cur.execute(f"SELECT version FROM {db_adapter.production_schema}.py_load_uniprot_metadata")
         assert cur.fetchone()[0] == "V1_CONFLICT_TEST", "Metadata version should be unchanged."
+
+
+SAMPLE_XML_V2_ONLY_NEW_CONTENT = """<?xml version="1.0" encoding="UTF-8"?>
+<uniprot xmlns="http://uniprot.org/uniprot">
+<entry dataset="Swiss-Prot" created="2025-01-01" modified="2025-01-01" version="1">
+  <accession>A0A0A0</accession>
+  <name>TEST3_NEW</name>
+  <protein>
+    <recommendedName><fullName>Test protein 3 - New</fullName></recommendedName>
+  </protein>
+  <organism>
+    <name type="scientific">Pan troglodytes</name>
+    <dbReference type="NCBI Taxonomy" id="9598"/>
+    <lineage><taxon>Eukaryota</taxon><taxon>Metazoa</taxon></lineage>
+  </organism>
+  <sequence length="5" mass="555">MNEWP</sequence>
+</entry>
+</uniprot>
+"""
+
+
+@pytest.fixture
+def sample_xml_v2_only_new_file(tmp_path: Path) -> Path:
+    """Creates a gzipped sample V2 XML file with only a new entry for deletion testing."""
+    xml_path = tmp_path / "sample_v2_only_new.xml.gz"
+    with gzip.open(xml_path, "wt", encoding="utf-8") as f:
+        f.write(SAMPLE_XML_V2_ONLY_NEW_CONTENT)
+    return xml_path
+
+
+def test_delta_load_pure_deletion(
+    settings: Settings, db_adapter: PostgresAdapter, sample_xml_file: Path, sample_xml_v2_only_new_file: Path, mocker
+):
+    """
+    Tests that a delta load correctly handles the deletion of all existing
+    proteins when the new release file contains completely different entries.
+    """
+    # --- Arrange ---
+    settings.data_dir = sample_xml_file.parent
+    sprot_file = settings.data_dir / "uniprot_sprot.xml.gz"
+    sample_xml_file.rename(sprot_file)
+
+    pipeline = PyLoadUniprotPipeline(settings)
+    pipeline.db_adapter.production_schema = db_adapter.production_schema
+    pipeline.db_adapter.staging_schema = db_adapter.staging_schema
+
+    # --- Act 1: Initial Full Load (V1) ---
+    mocker.patch.object(
+        extractor.Extractor,
+        "get_release_info",
+        return_value={
+            "version": "V1_DEL_TEST",
+            "release_date": datetime.date(2024, 1, 1),
+            "swissprot_entry_count": 2,
+            "trembl_entry_count": 0,
+        },
+    )
+    pipeline.run(dataset="swissprot", mode="full")
+
+    # --- Assert 1: State after Full Load ---
+    with postgres_connection(settings) as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT COUNT(*) FROM {pipeline.db_adapter.production_schema}.proteins")
+        assert cur.fetchone()[0] == 2
+        cur.execute(
+            f"SELECT 1 FROM {pipeline.db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'"
+        )
+        assert cur.fetchone() is not None
+        cur.execute(
+            f"SELECT 1 FROM {pipeline.db_adapter.production_schema}.proteins WHERE primary_accession = 'P67890'"
+        )
+        assert cur.fetchone() is not None
+
+    # --- Act 2: Delta Load (V2 - only new protein) ---
+    sprot_file.rename(settings.data_dir / "uniprot_sprot_v1.xml.gz")
+    sample_xml_v2_only_new_file.rename(sprot_file)
+
+    mocker.patch.object(
+        extractor.Extractor,
+        "get_release_info",
+        return_value={
+            "version": "V2_DEL_TEST",
+            "release_date": datetime.date(2025, 1, 1),
+            "swissprot_entry_count": 1,
+            "trembl_entry_count": 0,
+        },
+    )
+    pipeline.run(dataset="swissprot", mode="delta")
+
+    # --- Assert 2: State after Delta Load ---
+    with postgres_connection(settings) as conn, conn.cursor() as cur:
+        # Check total count: should be 1 (only the new protein)
+        cur.execute(f"SELECT COUNT(*) FROM {pipeline.db_adapter.production_schema}.proteins")
+        assert cur.fetchone()[0] == 1, "Total protein count should be 1 after pure-delete delta."
+
+        # Check that the old proteins were deleted
+        cur.execute(
+            f"SELECT 1 FROM {pipeline.db_adapter.production_schema}.proteins WHERE primary_accession = 'P12345'"
+        )
+        assert cur.fetchone() is None, "Protein P12345 should have been deleted."
+        cur.execute(
+            f"SELECT 1 FROM {pipeline.db_adapter.production_schema}.proteins WHERE primary_accession = 'P67890'"
+        )
+        assert cur.fetchone() is None, "Protein P67890 should have been deleted."
+
+        # Check that the new protein was inserted
+        cur.execute(
+            f"SELECT uniprot_id FROM {pipeline.db_adapter.production_schema}.proteins WHERE primary_accession = 'A0A0A0'"
+        )
+        assert (
+            cur.fetchone()[0] == "TEST3_NEW"
+        ), "New protein A0A0A0 should have been inserted."
+
+        # Check that metadata was updated
+        cur.execute(
+            f"SELECT version FROM {pipeline.db_adapter.production_schema}.py_load_uniprot_metadata"
+        )
+        assert cur.fetchone()[0] == "V2_DEL_TEST"

@@ -1,7 +1,6 @@
 from unittest.mock import MagicMock, patch
 
 from typer.testing import CliRunner
-import pytest
 
 from py_load_uniprot.cli import app
 

@@ -7,3 +7,9 @@ __pycache__/
 
 # Downloaded data files
 data/
+
+# Coverage reports
+.coverage
+htmlcov/
+.coverage.*
+coverage.xml

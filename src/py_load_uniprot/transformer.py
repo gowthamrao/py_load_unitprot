@@ -290,10 +290,12 @@ def _writer_process(
 
             accession = protein_row[0]
             if accession in seen_protein_accessions:
-                duplicate_accessions.add(accession)
-                processed_count += 1
-                progress.update(task, advance=1)
-                continue  # Skip the entire entry for this duplicate protein
+                # Instead of just warning, we raise an error to fail the pipeline.
+                # Silently dropping data can be dangerous.
+                raise ValueError(
+                    f"Duplicate primary accession '{accession}' found in the same input file. "
+                    "Source data must be clean. Halting pipeline."
+                )
 
             seen_protein_accessions.add(accession)
 
@@ -315,13 +317,6 @@ def _writer_process(
             processed_count += 1
             progress.update(task, advance=1)
 
-    if duplicate_accessions:
-        logging.warning(
-            f"Found {len(duplicate_accessions)} duplicate primary accessions in the source file. "
-            f"Only the first occurrence of each was written to the output. "
-            f"Duplicates: {', '.join(sorted(list(duplicate_accessions))[:5])}"
-            f"{'...' if len(duplicate_accessions) > 5 else ''}"
-        )
 
 
 def _get_total_entries(xml_file: Path) -> int:
@@ -382,7 +377,10 @@ def _transform_single_threaded(xml_file: Path, output_dir: Path, profile: str) -
                 accession = protein_row[0] if protein_row else None
 
                 if accession and accession in seen_protein_accessions:
-                    duplicate_accessions.add(accession)
+                    raise ValueError(
+                        f"Duplicate primary accession '{accession}' found in the same input file. "
+                        "Source data must be clean. Halting pipeline."
+                    )
                 else:
                     if accession:
                         seen_protein_accessions.add(accession)
@@ -406,13 +404,6 @@ def _transform_single_threaded(xml_file: Path, output_dir: Path, profile: str) -
             while elem.getprevious() is not None:
                 del elem.getparent()[0]
 
-    if duplicate_accessions:
-        logging.warning(
-            f"Found {len(duplicate_accessions)} duplicate primary accessions in the source file. "
-            f"Only the first occurrence of each was written to the output. "
-            f"Duplicates: {', '.join(sorted(list(duplicate_accessions))[:5])}"
-            f"{'...' if len(duplicate_accessions) > 5 else ''}"
-        )
     print("[bold green]Single-threaded transformation complete.[/bold green]")
 
 
